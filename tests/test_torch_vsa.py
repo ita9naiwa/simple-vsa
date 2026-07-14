@@ -1,82 +1,130 @@
-import math
-
 import pytest
 import torch
-import torch.nn.functional as F
 
-from vsa import torch_vsa
-
-
-def _naive_selected_attention(q, k, v, selected, block_size, causal=False):
-    batch, heads, query_tokens, head_dim = q.shape
-    output = torch.empty_like(q)
-    scale = 1.0 / math.sqrt(head_dim)
-
-    for b in range(batch):
-        for h in range(heads):
-            for query_token in range(query_tokens):
-                query_block = query_token // block_size
-                key_ids = []
-                for key_block in selected[b, h, query_block].tolist():
-                    key_ids.extend(range(key_block * block_size, (key_block + 1) * block_size))
-                if causal:
-                    key_ids = [index for index in key_ids if index <= query_token]
-                key_index = torch.tensor(key_ids, device=q.device)
-                scores = (q[b, h, query_token].float() @ k[b, h, key_index].float().T) * scale
-                probabilities = torch.softmax(scores, dim=-1).to(v.dtype)
-                output[b, h, query_token] = probabilities @ v[b, h, key_index]
-    return output
+from vsa import torch_vsa, video_sparse_attn
+from vsa.common import coarse_branch
 
 
-@pytest.mark.parametrize("causal", [False, True])
-def test_torch_vsa_matches_naive_selected_attention(causal):
-    torch.manual_seed(7)
-    q = torch.randn(2, 2, 16, 8)
-    k = torch.randn(2, 2, 16, 8)
-    v = torch.randn(2, 2, 16, 8)
+def _full_blocks(num_blocks, block_elements, device="cpu"):
+    return torch.full((num_blocks,), block_elements, dtype=torch.long, device=device)
 
-    actual, selected = torch_vsa(
-        q, k, v, block_size=4, topk=2, causal=causal, return_indices=True
-    )
-    expected = _naive_selected_attention(q, k, v, selected, 4, causal)
 
+def test_matches_fastvideo_reference_full_blocks():
+    # torch_vsa (gather sparse branch) must equal the masked-fill reference.
+    torch.manual_seed(1)
+    be, nb = 4, 4
+    seq = be * nb
+    q = torch.randn(2, 2, seq, 16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = _full_blocks(nb, be)
+
+    actual = torch_vsa(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be))
+    expected = video_sparse_attn(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be))
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_torch_vsa_backpropagates_through_fine_attention():
-    torch.manual_seed(11)
-    q = torch.randn(1, 1, 8, 4, requires_grad=True)
-    k = torch.randn(1, 1, 8, 4, requires_grad=True)
-    v = torch.randn(1, 1, 8, 4, requires_grad=True)
-
-    torch_vsa(q, k, v, block_size=4, topk=1).square().mean().backward()
-
-    assert q.grad is not None
-    assert k.grad is not None
-    assert v.grad is not None
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_selecting_every_block_matches_dense_attention(causal):
-    torch.manual_seed(19)
-    q = torch.randn(1, 2, 16, 8)
+def test_matches_fastvideo_reference_padded_blocks():
+    # Partially-filled (padded) blocks: padding must be excluded from both branches.
+    torch.manual_seed(2)
+    be, nb = 4, 3
+    seq = be * nb
+    q = torch.randn(1, 2, seq, 16)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
+    vbs = torch.tensor([4, 2, 3])  # last two blocks are padded
 
-    sparse = torch_vsa(q, k, v, block_size=4, topk=4, causal=causal)
-    dense = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    actual = torch_vsa(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be))
+    expected = video_sparse_attn(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be))
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
-    torch.testing.assert_close(sparse, dense, atol=1e-5, rtol=1e-5)
+
+def test_compress_attn_weight_matches_reference_gate():
+    torch.manual_seed(3)
+    be, nb = 4, 4
+    seq = be * nb
+    q = torch.randn(1, 2, seq, 16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = _full_blocks(nb, be)
+    gate = torch.randn(1, 2, seq, 16)
+
+    actual = torch_vsa(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be), compress_attn_weight=gate)
+    expected = video_sparse_attn(
+        q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be), compress_attn_weight=gate
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_int_block_size_volume():
+    # block_size as int is treated as a cube, matching _as_block_elements.
+    torch.manual_seed(4)
+    be, nb = 8, 3  # int block_size=2 -> 2**3 = 8 tokens per block
+    seq = be * nb
+    q = torch.randn(1, 1, seq, 8)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = _full_blocks(nb, be)
+
+    actual = torch_vsa(q, k, v, vbs, vbs, topk=2, block_size=2)
+    expected = video_sparse_attn(q, k, v, vbs, vbs, topk=2, block_size=2)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_differentiable():
+    torch.manual_seed(5)
+    be, nb = 4, 3
+    seq = be * nb
+    q = torch.randn(1, 1, seq, 8, requires_grad=True)
+    k = torch.randn(1, 1, seq, 8, requires_grad=True)
+    v = torch.randn(1, 1, seq, 8, requires_grad=True)
+    vbs = _full_blocks(nb, be)
+
+    torch_vsa(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be)).square().mean().backward()
+
+    for grad in (q.grad, k.grad, v.grad):
+        assert grad is not None and torch.isfinite(grad).all()
+
+
+def test_compression_branch_gives_gradient_to_unselected_blocks():
+    # The compression branch's softmax spans all blocks, so even a key block that
+    # no query block selects (topk=1) still receives gradient.
+    torch.manual_seed(6)
+    be, nb = 4, 4
+    seq = be * nb
+    q = torch.randn(1, 1, seq, 8)
+    k = torch.randn(1, 1, seq, 8, requires_grad=True)
+    v = torch.randn(1, 1, seq, 8, requires_grad=True)
+    vbs = _full_blocks(nb, be)
+
+    scores, _ = coarse_branch(q, k.detach(), v.detach(), vbs, vbs, be, 1.0 / (8 ** 0.5))
+    selected = scores.topk(1, dim=-1).indices
+    unselected = sorted(set(range(nb)) - set(selected.flatten().tolist()))
+    assert unselected, "expected at least one never-selected block for this seed"
+
+    torch_vsa(q, k, v, vbs, vbs, topk=1, block_size=(1, 1, be)).square().mean().backward()
+
+    for block in unselected:
+        grad_block = k.grad[0, 0, block * be : (block + 1) * be]
+        assert grad_block.abs().sum() > 0
 
 
 def test_rejects_non_divisible_sequence_length():
-    q = k = v = torch.randn(1, 1, 7, 8)
+    q = k = v = torch.randn(1, 1, 10, 8)
+    vbs = _full_blocks(2, 4)  # implies seq 8, but seq is 10
     with pytest.raises(ValueError, match="divisible"):
-        torch_vsa(q, k, v, block_size=4, topk=1)
+        torch_vsa(q, k, v, vbs, vbs, topk=1, block_size=(1, 1, 4))
 
 
-def test_rejects_mixed_dtypes():
-    q = torch.randn(1, 1, 8, 8, dtype=torch.float32)
-    k = v = torch.randn(1, 1, 8, 8, dtype=torch.float64)
-    with pytest.raises(ValueError, match="same dtype"):
-        torch_vsa(q, k, v, block_size=4, topk=1)
+def test_rejects_wrong_block_sizes_length():
+    q = k = v = torch.randn(1, 1, 12, 8)
+    vbs = _full_blocks(2, 4)  # 12 / 4 = 3 blocks, but vbs has length 2
+    with pytest.raises(ValueError, match="variable_block_sizes"):
+        torch_vsa(q, k, v, vbs, vbs, topk=1, block_size=(1, 1, 4))
+
+
+def test_rejects_topk_out_of_range():
+    q = k = v = torch.randn(1, 1, 12, 8)
+    vbs = _full_blocks(3, 4)
+    with pytest.raises(ValueError, match="topk"):
+        torch_vsa(q, k, v, vbs, vbs, topk=4, block_size=(1, 1, 4))

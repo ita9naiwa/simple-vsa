@@ -1,4 +1,4 @@
-"""Tests for the portable FastVideo VSA reference (vsa.fastvideo_ref)."""
+"""Tests for the shared VSA helpers and the reference (vsa.common) + tiling."""
 
 import math
 
@@ -6,11 +6,57 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vsa import block_mean, build_vsa_metadata, tile, untile, video_sparse_attn
+from vsa import (
+    CompressionGate,
+    block_mean,
+    build_vsa_metadata,
+    tile,
+    untile,
+    video_sparse_attn,
+)
 
 
 def _full_size_blocks(num_blocks, block_elements, device="cpu"):
     return torch.full((num_blocks,), block_elements, dtype=torch.long, device=device)
+
+
+def test_compression_gate_shape_and_layout():
+    torch.manual_seed(0)
+    batch, heads, seq, head_dim = 2, 3, 12, 8
+    dim = heads * head_dim
+    gate_layer = CompressionGate(dim=dim, num_heads=heads)
+    gate = gate_layer(torch.randn(batch, seq, dim))
+    assert gate.shape == (batch, heads, seq, head_dim)
+
+
+def test_compression_gate_trains_end_to_end():
+    # The gate layer sits outside the attention op; here we wire it in and check
+    # that gradient reaches its Linear weights through the compression branch.
+    torch.manual_seed(1)
+    batch, heads, head_dim = 1, 2, 8
+    be, nb = 4, 3
+    seq = be * nb
+    dim = heads * head_dim
+
+    hidden = torch.randn(batch, seq, dim)
+    q = torch.randn(batch, heads, seq, head_dim)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = _full_size_blocks(nb, be)
+
+    gate_layer = CompressionGate(dim=dim, num_heads=heads)
+    gate = gate_layer(hidden)  # [B, H, S, D]
+    out = video_sparse_attn(q, k, v, vbs, vbs, topk=2, block_size=(1, 1, be),
+                            compress_attn_weight=gate)
+    out.square().mean().backward()
+
+    grad = gate_layer.to_gate_compress.weight.grad
+    assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
+def test_compression_gate_rejects_indivisible_dim():
+    with pytest.raises(ValueError, match="divisible"):
+        CompressionGate(dim=10, num_heads=3)
 
 
 def test_block_mean_matches_masked_mean():

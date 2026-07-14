@@ -1,24 +1,26 @@
 # Simple VSA: PyTorch + Triton
 
-This repository is a small, readable implementation of the core Video Sparse
-Attention (VSA) idea. It contains the same algorithm in two forms:
+This repository is a small, readable implementation of Video Sparse Attention
+(VSA). It follows the exact math and API of
+[`fastvideo_kernel.ops.video_sparse_attn`](https://github.com/hao-ai-lab/FastVideo),
+in three forms:
 
-- `torch_vsa`: reference implementation, CPU/CUDA, autograd through fine attention.
-- `triton_vsa`: CUDA forward kernel with online softmax.
+- `video_sparse_attn`: faithful PyTorch reference (masked-fill sparse branch).
+- `torch_vsa`: same math, but the sparse branch *gathers* only the selected
+  blocks (real sparse work); CPU/CUDA, fully differentiable.
+- `triton_vsa`: CUDA forward kernel for the sparse branch with online softmax.
 
-The data flow is:
+Each token stream is split into padded blocks (a 1D block stands in for a 3D
+spatiotemporal tile). The two branches are summed per token:
 
-1. Split Q and K into contiguous token blocks.
-2. Mean-pool each block.
-3. Score every query block against every key block at low resolution.
-4. Keep the Top-K key blocks for each query block.
-5. Run full token attention only inside those selected blocks.
+1. **Compression branch** — mean-pool every block, run dense block-vs-block
+   attention, broadcast each query block's output back to its tokens.
+2. **Sparse branch** — the same block-vs-block `scores` pick the Top-K key blocks
+   per query block; full token attention runs only inside them.
 
-This is intentionally a teaching implementation, not a drop-in replacement for
-the complete VSA training stack. The original method adds a trainable selector,
-coarse/fine fusion, optimized backward kernels, and video-specific 3D cube
-layout. Here, a 1D token block stands in for a spatiotemporal cube so the sparse
-attention mechanism stays visible.
+`out = out_c * compress_attn_weight + out_s`. The Top-K choice is discrete (no
+gradient), but the shared compression `scores` route gradient into the pooled
+blocks, so the selector trains end-to-end — exactly as VSA/NSA do.
 
 ## Run
 
@@ -39,19 +41,35 @@ pytest -q tests/test_triton_vsa.py
 
 ## API
 
-Both implementations accept `[batch, heads, tokens, head_dim]` tensors:
+All three functions share the FastVideo signature and accept
+`[batch, heads, seq_len, head_dim]` tensors:
 
 ```python
 from vsa import torch_vsa, triton_vsa
 
-out = torch_vsa(q, k, v, block_size=16, topk=2, causal=False)
+# valid token count per kv / query block (blocks are padded to block_size volume)
+variable_block_sizes = torch.full((num_blocks,), block_elements, dtype=torch.long)
+
+out = torch_vsa(
+    q, k, v,
+    variable_block_sizes,      # kv blocks
+    variable_block_sizes,      # query blocks
+    topk=2,
+    block_size=(1, 1, block_elements),   # tile shape; only its volume matters
+    compress_attn_weight=None,           # optional gate on the compression branch
+)
 
 with torch.no_grad():
-    out_gpu = triton_vsa(q.cuda(), k.cuda(), v.cuda(), block_size=16, topk=2)
+    out_gpu = triton_vsa(q.cuda(), k.cuda(), v.cuda(),
+                         variable_block_sizes.cuda(), variable_block_sizes.cuda(),
+                         topk=2, block_size=(1, 1, block_elements))
 ```
 
-Sequence lengths must be divisible by `block_size`. The Triton path is
-forward-only and supports head dimensions up to 256.
+`seq_len` must be divisible by `block_elements = prod(block_size)` and
+`*_variable_block_sizes` gives the real (non-padding) token count per block. The
+scale is fixed at `1/sqrt(head_dim)`. The Triton path supports autograd for
+`q`, `k`, and `v` through custom backward kernels (Top-K routing remains
+discrete), and supports head dimensions up to 256.
 
 ## References
 

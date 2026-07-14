@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from .fastvideo_ref import block_mean, topk_block_mask, video_sparse_attn
+from .common import CompressionGate, block_mean, topk_block_mask, video_sparse_attn
 from .fastvideo_tiling import build_vsa_metadata, tile, untile
 from .torch_impl import torch_vsa
 
@@ -11,6 +11,7 @@ __all__ = [
     "torch_vsa",
     "triton_vsa",
     "video_sparse_attn",
+    "CompressionGate",
     "block_mean",
     "topk_block_mask",
     "build_vsa_metadata",
