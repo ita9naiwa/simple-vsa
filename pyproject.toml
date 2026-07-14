@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-vsa"
+version = "0.1.0"
+description = "Small educational Video Sparse Attention implementations in PyTorch and Triton"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.4"]
+
+[project.optional-dependencies]
+gpu = ["triton>=3.0; platform_system == 'Linux'"]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["vsa*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
