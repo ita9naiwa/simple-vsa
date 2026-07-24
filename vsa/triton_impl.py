@@ -1199,7 +1199,6 @@ def _vsa_dkdv_256_kernel(
         0,
         query_count,
         loop_unroll_factor=1,
-        warp_specialize=True,
     ):
         query_block = tl.load(
             K2Q + inverse_row + query_slot
