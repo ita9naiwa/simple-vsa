@@ -1677,6 +1677,7 @@ def _vsa_with_sparse_executor(
             scale,
         )
     selected = scores.topk(topk, dim=-1, sorted=False).indices
+    selected = selected.sort(dim=-1).values
     out_s = sparse_executor(
         q,
         k,
