@@ -271,7 +271,7 @@ class _FusedCombine(torch.autograd.Function):
             gate = gate.contiguous()
         out = torch.empty_like(sparse)
         num_tokens = sparse.numel() // sparse.shape[-1]
-        block = 256
+        block = 1024
         grid = (triton.cdiv(sparse.numel(), block),)
         _combine_forward_kernel[grid](
             sparse,
