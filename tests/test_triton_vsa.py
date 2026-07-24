@@ -3,10 +3,19 @@ import importlib.util
 import pytest
 import torch
 
-from vsa import torch_vsa, triton_sparse_attention, triton_vsa
+from vsa import (
+    cute_triton_vsa,
+    torch_vsa,
+    triton_sparse_attention,
+    triton_vsa,
+)
 
 
 HAS_TRITON = importlib.util.find_spec("triton") is not None
+HAS_CUTE = (
+    importlib.util.find_spec("flash_attn") is not None
+    and importlib.util.find_spec("flash_attn.cute") is not None
+)
 
 
 def _full_blocks(num_blocks, block_elements, device):
@@ -385,4 +394,55 @@ def test_triton_256_backward_matches_torch_with_padding():
             expected_input.grad,
             atol=8e-2,
             rtol=8e-2,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not installed")
+@pytest.mark.skipif(not HAS_CUTE, reason="FA4 CuTe is not installed")
+def test_cute_triton_256_matches_owned_triton_forward_and_backward():
+    torch.manual_seed(37)
+    be, nb, dim = 256, 2, 128
+    shape = (1, 1, be * nb, dim)
+    inputs = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    grad_output = torch.randn_like(inputs[0])
+    vbs = torch.tensor([256, 173], device="cuda")
+    triton_inputs = [
+        x.detach().clone().requires_grad_() for x in inputs
+    ]
+    hybrid_inputs = [
+        x.detach().clone().requires_grad_() for x in inputs
+    ]
+
+    expected = triton_vsa(
+        *triton_inputs,
+        vbs,
+        vbs,
+        topk=2,
+        block_size=(1, 1, be),
+    )
+    actual = cute_triton_vsa(
+        *hybrid_inputs,
+        vbs,
+        vbs,
+        topk=2,
+        block_size=(1, 1, be),
+    )
+    expected.backward(grad_output)
+    actual.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    for actual_input, expected_input in zip(
+        hybrid_inputs,
+        triton_inputs,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_input.grad,
+            expected_input.grad,
+            atol=2e-2,
+            rtol=2e-2,
         )

@@ -1621,7 +1621,7 @@ def triton_sparse_attention(
     )
 
 
-def triton_vsa(
+def _vsa_with_sparse_executor(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1630,9 +1630,9 @@ def triton_vsa(
     topk: int,
     block_size: int | tuple = 64,
     compress_attn_weight: Optional[Tensor] = None,
+    *,
+    sparse_executor,
 ) -> Tensor:
-    """Run PyTorch coarse attention plus tiled Triton sparse fine attention."""
-
     block_elements = _as_block_elements(block_size)
     validate_vsa_inputs(
         q,
@@ -1677,13 +1677,12 @@ def triton_vsa(
             scale,
         )
     selected = scores.topk(topk, dim=-1, sorted=False).indices
-    out_s = _triton_sparse_attention(
+    out_s = sparse_executor(
         q,
         k,
         v,
         selected,
         variable_block_sizes,
-        block_size=block_elements,
         sm_scale=scale,
     )
 
@@ -1699,3 +1698,37 @@ def triton_vsa(
     else:
         output = out_c * compress_attn_weight.float() + out_s.float()
     return output.to(q.dtype)
+
+
+def triton_vsa(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    variable_block_sizes: Tensor,
+    q_variable_block_sizes: Tensor,
+    topk: int,
+    block_size: int | tuple = 64,
+    compress_attn_weight: Optional[Tensor] = None,
+) -> Tensor:
+    """Run the shared VSA path with owned Triton forward and backward."""
+
+    block_elements = _as_block_elements(block_size)
+
+    def execute(*args, **kwargs):
+        return _triton_sparse_attention(
+            *args,
+            block_size=block_elements,
+            **kwargs,
+        )
+
+    return _vsa_with_sparse_executor(
+        q,
+        k,
+        v,
+        variable_block_sizes,
+        q_variable_block_sizes,
+        topk,
+        block_size,
+        compress_attn_weight,
+        sparse_executor=execute,
+    )

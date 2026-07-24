@@ -11,6 +11,8 @@ __all__ = [
     "torch_vsa",
     "triton_vsa",
     "triton_sparse_attention",
+    "cute_triton_vsa",
+    "cute_triton_sparse_attention",
     "helion_vsa",
     "helion_sparse_attention",
     "video_sparse_attn",
@@ -34,6 +36,20 @@ def triton_vsa(*args: Any, **kwargs: Any) -> Any:
 def triton_sparse_attention(*args: Any, **kwargs: Any) -> Any:
     """Load the route-explicit Triton sparse executor on demand."""
     from .triton_impl import triton_sparse_attention as _implementation
+
+    return _implementation(*args, **kwargs)
+
+
+def cute_triton_vsa(*args: Any, **kwargs: Any) -> Any:
+    """Load the optional CuTe-forward/Triton-backward implementation."""
+    from .cute_triton import cute_triton_vsa as _implementation
+
+    return _implementation(*args, **kwargs)
+
+
+def cute_triton_sparse_attention(*args: Any, **kwargs: Any) -> Any:
+    """Load the route-explicit CuTe/Triton hybrid executor."""
+    from .cute_triton import cute_triton_sparse_attention as _implementation
 
     return _implementation(*args, **kwargs)
 

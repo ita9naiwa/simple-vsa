@@ -110,6 +110,9 @@ broadcast/add by default. Set `SIMPLE_VSA_FUSED_COMMON=0` to run the readable
 eager common path for A/B validation. Logical-256 Triton uses B300-tuned
 Q128 x KV64 forward and backward tiles. Logical-256
 Helion evaluates a bounded Q128/Q256 x KV64/KV128 forward config set.
+When FastVideo's optional FA4 CuTe dependencies are installed,
+`cute_triton_vsa` combines its faster 256-token forward with the same owned
+Triton backward; `triton_vsa` remains dependency-free and unchanged.
 For reproducible one-config runs, set
 `SIMPLE_VSA_HELION_FWD_TILE=128x64|128x128|256x64|256x128`, or
 `SIMPLE_VSA_HELION_DQ_TILE=64x64|128x64|128x128` before importing `vsa`.

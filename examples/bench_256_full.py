@@ -13,13 +13,14 @@ its fwd+bwd / backward cells are marked "X". bf16, CUDA, batch=1, eager.
         python -u examples/bench_256_full.py
 """
 
+import importlib.util
 import math
 import os
 import time
 
 import torch
 
-from vsa import triton_vsa
+from vsa import cute_triton_vsa, triton_vsa
 
 torch.set_float32_matmul_precision("high")
 
@@ -84,6 +85,13 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
 
     # (label, callable, backend-env-or-None, has_backward)
     rows = [("triton_vsa", triton_vsa, None, True)]
+    if (
+        importlib.util.find_spec("flash_attn") is not None
+        and importlib.util.find_spec("flash_attn.cute") is not None
+    ):
+        rows.append(
+            ("cute+triton_vsa", cute_triton_vsa, None, True)
+        )
     if fvk_vsa is not None:
         rows.append(("fastvideo(triton) route-A 256->64", fvk_vsa, "triton", True))
         rows.append(("fastvideo CuTe FA4 256x128", fvk_vsa, "cutedsl", False))
