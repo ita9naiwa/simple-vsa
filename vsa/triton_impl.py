@@ -42,10 +42,6 @@ def _tile_candidates(env_name: str, defaults: tuple[int, ...]) -> tuple[int, ...
     return (tile,)
 
 
-_FWD_Q_TILES = _tile_candidates(
-    "SIMPLE_VSA_TRITON_FWD_Q_TILE",
-    (64, 128, 256),
-)
 _BWD_Q_TILES = _tile_candidates(
     "SIMPLE_VSA_TRITON_BWD_Q_TILE",
     (64, 128),
@@ -55,29 +51,6 @@ _AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=warps, num_stages=stages)
     for warps in (4, 8)
     for stages in (2, 3, 4)
-]
-
-_AUTOTUNE_CONFIGS_256 = [
-    triton.Config(
-        {"Q_TILE": q_tile},
-        num_warps=warps,
-        num_stages=stages,
-    )
-    for q_tile, warps, stages in (
-        (64, 4, 1),
-        (64, 4, 2),
-        (64, 4, 3),
-        (64, 4, 4),
-        (64, 8, 3),
-        (128, 4, 1),
-        (128, 4, 2),
-        (128, 4, 3),
-        (128, 4, 4),
-        (128, 8, 1),
-        (128, 8, 2),
-        (256, 4, 1),
-    )
-    if q_tile in _FWD_Q_TILES
 ]
 
 _AUTOTUNE_DQ_256 = [
@@ -249,10 +222,6 @@ def _vsa_tiled_forward_kernel(
         tl.store(lse_ptrs, lse, mask=rows < BLOCK_ELEMENTS)
 
 
-@triton.autotune(
-    configs=_AUTOTUNE_CONFIGS_256,
-    key=["Q_TOKENS", "HEAD_DIM", "TOPK", "STORE_LSE"],
-)
 @triton.jit
 def _vsa_tiled_forward_256_kernel(
     Q,
@@ -291,7 +260,7 @@ def _vsa_tiled_forward_256_kernel(
     STORE_LSE: tl.constexpr,
     Q_TILE: tl.constexpr,
 ):
-    """Logical-Q256 forward with autotuned physical Q tiles and KV64."""
+    """Logical-Q256 forward with physical Q128 and KV64 tiles."""
 
     query_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -485,12 +454,15 @@ def _triton_sparse_attention_forward(
         else _vsa_tiled_forward_kernel
     )
     if block_size == 256:
-        grid = lambda meta: (
-            query_blocks * (256 // meta["Q_TILE"]),
-            batch * heads,
-        )
+        grid = (query_blocks * 2, batch * heads)
+        launch_options = {
+            "Q_TILE": 128,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
     else:
         grid = (query_blocks, batch * heads)
+        launch_options = {}
     forward_kernel[grid](
         q,
         k,
@@ -526,6 +498,7 @@ def _triton_sparse_attention_forward(
         BLOCK_D=block_d,
         TOPK=topk,
         STORE_LSE=save_lse,
+        **launch_options,
     )
     return output, lse
 

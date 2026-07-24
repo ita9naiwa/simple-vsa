@@ -8,7 +8,7 @@ kernel differs:
                                64-token Triton block-sparse kernel.
   - FASTVIDEO_VSA_CUTEDSL=1  -> FA4 CuTe: logical Q256 routing with physical
                                KV128 blocks (forward only, Blackwell sm_100+).
-  - repo Triton              -> autotunes physical Q64/Q128/Q256 x KV64.
+  - repo Triton              -> B300-tuned physical Q128 x KV64.
 
 The backend is resolved from the env var at call time, so we flip it in-process
 between timing loops. bf16, CUDA, batch=1. Times are ms/iter (fwd only).

@@ -108,10 +108,10 @@ materializing gathered K/V blocks.
 The CUDA paths use training-safe fused block means and a fused compact-coarse
 broadcast/add by default. Set `SIMPLE_VSA_FUSED_COMMON=0` to run the readable
 eager common path for A/B validation. Logical-256 Triton autotunes physical
-Q64/Q128/Q256 x KV64 forward tiles plus Q64/Q128 backward tiles. Logical-256
+Q64/Q128 backward tiles and uses a B300-tuned Q128 x KV64 forward tile.
+Logical-256
 Helion evaluates a bounded Q128/Q256 x KV64/KV128 forward config set.
 For reproducible one-config runs, set
-`SIMPLE_VSA_TRITON_FWD_Q_TILE=64|128|256`,
 `SIMPLE_VSA_TRITON_BWD_Q_TILE=64|128`,
 `SIMPLE_VSA_HELION_FWD_TILE=128x64|128x128|256x64|256x128`, or
 `SIMPLE_VSA_HELION_DQ_TILE=64x64|128x64|128x128` before importing `vsa`.
