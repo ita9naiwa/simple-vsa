@@ -61,14 +61,21 @@ _AUTOTUNE_CONFIGS_256 = [
     triton.Config(
         {"Q_TILE": q_tile},
         num_warps=warps,
-        num_stages=1,
+        num_stages=stages,
     )
-    for q_tile, warps in (
-        (64, 4),
-        (128, 4),
-        (128, 8),
-        (256, 4),
-        (256, 8),
+    for q_tile, warps, stages in (
+        (64, 4, 1),
+        (64, 4, 2),
+        (64, 4, 3),
+        (64, 4, 4),
+        (64, 8, 3),
+        (128, 4, 1),
+        (128, 4, 2),
+        (128, 4, 3),
+        (128, 4, 4),
+        (128, 8, 1),
+        (128, 8, 2),
+        (256, 4, 1),
     )
     if q_tile in _FWD_Q_TILES
 ]
