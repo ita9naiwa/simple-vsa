@@ -680,6 +680,7 @@ def _vsa_dq_256_kernel(
     Q,
     K,
     V,
+    OUT,
     DOUT,
     LSE,
     DELTA,
@@ -698,6 +699,10 @@ def _vsa_dq_256_kernel(
     stride_vh,
     stride_vs,
     stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_os,
+    stride_od,
     stride_dob,
     stride_doh,
     stride_dos,
@@ -745,10 +750,19 @@ def _vsa_dq_256_kernel(
         + query_positions[:, None] * stride_dos
         + dims[None, :] * stride_dod
     )
+    out_ptrs = (
+        OUT
+        + batch.to(tl.int64) * stride_ob
+        + head.to(tl.int64) * stride_oh
+        + query_positions[:, None] * stride_os
+        + dims[None, :] * stride_od
+    )
     query = tl.load(q_ptrs, mask=q_mask, other=0.0)
     dout = tl.load(do_ptrs, mask=q_mask, other=0.0)
+    out = tl.load(out_ptrs, mask=q_mask, other=0.0).to(tl.float32)
     lse = tl.load(LSE + batch_head * Q_TOKENS + query_positions)
-    delta = tl.load(DELTA + batch_head * Q_TOKENS + query_positions)
+    delta = tl.sum(out * dout.to(tl.float32), axis=1)
+    tl.store(DELTA + batch_head * Q_TOKENS + query_positions, delta)
 
     dq = tl.zeros([Q_TILE, BLOCK_D], dtype=tl.float32)
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
@@ -1313,27 +1327,7 @@ def _triton_sparse_attention_backward(
     block_d = max(16, triton.next_power_of_2(head_dim))
 
     delta = torch.empty_like(lse)
-    if block_size == 256:
-        delta_grid = (query_blocks * 4, batch * heads)
-        _delta_256_kernel[delta_grid](
-            output,
-            grad_output,
-            delta,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            output.stride(3),
-            grad_output.stride(0),
-            grad_output.stride(1),
-            grad_output.stride(2),
-            grad_output.stride(3),
-            Q_TOKENS=query_tokens,
-            HEADS=heads,
-            HEAD_DIM=head_dim,
-            BLOCK_D=block_d,
-            num_warps=4,
-        )
-    else:
+    if block_size != 256:
         delta_grid = (query_blocks, batch * heads)
         _delta_kernel[delta_grid](
             output,
@@ -1370,6 +1364,7 @@ def _triton_sparse_attention_backward(
             q,
             k,
             v,
+            output,
             grad_output,
             lse,
             delta,
@@ -1379,6 +1374,8 @@ def _triton_sparse_attention_backward(
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            output.stride(0), output.stride(1),
+            output.stride(2), output.stride(3),
             grad_output.stride(0), grad_output.stride(1),
             grad_output.stride(2), grad_output.stride(3),
             dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
