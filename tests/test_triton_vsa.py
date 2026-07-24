@@ -102,18 +102,21 @@ def test_fused_combine_forward_and_backward_match_torch(with_gate):
     coarse_expanded = coarse_ref.float()[:, :, :, None, :].expand(
         -1, -1, -1, be, -1
     ).reshape_as(sparse_ref)
-    expected = sparse_ref.float() + (
-        coarse_expanded * gate_ref.float()
-        if gate_ref is not None
-        else coarse_expanded
-    )
+    expected = (
+        sparse_ref.float()
+        + (
+            coarse_expanded * gate_ref.float()
+            if gate_ref is not None
+            else coarse_expanded
+        )
+    ).to(sparse_ref.dtype)
     actual = fused_combine(
         sparse_actual,
         coarse_actual,
         gate_actual,
         be,
     )
-    expected.backward(grad.float())
+    expected.backward(grad)
     actual.backward(grad)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
