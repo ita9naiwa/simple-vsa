@@ -15,6 +15,7 @@ large gradient atomics.  Neither direction materializes gathered
 from __future__ import annotations
 
 import math
+import os
 from typing import Any, Optional
 
 import torch
@@ -23,7 +24,53 @@ from torch import Tensor
 import helion
 import helion.language as hl
 
-from .common import _as_block_elements, coarse_branch, validate_vsa_inputs
+from .common import (
+    _as_block_elements,
+    coarse_branch,
+    coarse_branch_compact,
+    validate_vsa_inputs,
+)
+from .fused_common import fused_block_mean, fused_combine
+
+
+def _helion_tile_specs(
+    env_name: str,
+    specs: tuple[tuple[Any, ...], ...],
+) -> tuple[tuple[Any, ...], ...]:
+    value = os.environ.get(env_name)
+    if value is None or value == "auto":
+        return specs
+    try:
+        q_tile, kv_tile = (int(part) for part in value.lower().split("x"))
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must use QxKV form, e.g. 128x64") from exc
+    selected = tuple(
+        spec for spec in specs if spec[0] == q_tile and spec[1] == kv_tile
+    )
+    if not selected:
+        choices = "/".join(f"{spec[0]}x{spec[1]}" for spec in specs)
+        raise ValueError(f"{env_name} must be one of auto/{choices}")
+    return selected
+
+
+_HELION_FWD_256_SPECS = _helion_tile_specs(
+    "SIMPLE_VSA_HELION_FWD_TILE",
+    (
+        (128, 64, None, "flat", 4, 1),
+        (128, 128, True, "persistent_interleaved", 4, 2),
+        (256, 64, True, "persistent_interleaved", 4, 3),
+        (256, 128, True, "persistent_interleaved", 8, 3),
+    ),
+)
+_HELION_DQ_256_SPECS = _helion_tile_specs(
+    "SIMPLE_VSA_HELION_DQ_TILE",
+    (
+        (64, 64, 4, 1),
+        (128, 64, 4, 1),
+        (128, 64, 8, 1),
+        (128, 128, 8, 2),
+    ),
+)
 
 
 @helion.kernel(
@@ -132,15 +179,19 @@ def _helion_sparse_attention_forward(
 
 
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[256, 64],
-        range_warp_specializes=[True, None],
-        range_multi_buffers=[None, False],
-        pid_type="persistent_interleaved",
-        indexing="pointer",
-        num_warps=4,
-        num_stages=3,
-    ),
+    configs=[
+        helion.Config(
+            block_sizes=[q_tile, kv_tile],
+            range_warp_specializes=[warp_specialize, None],
+            range_multi_buffers=[None, False],
+            pid_type=pid_type,
+            indexing="pointer",
+            num_warps=warps,
+            num_stages=stages,
+        )
+        for q_tile, kv_tile, warp_specialize, pid_type, warps, stages in
+        _HELION_FWD_256_SPECS
+    ],
     static_shapes=True,
 )
 def _helion_sparse_attention_forward_256(
@@ -151,12 +202,11 @@ def _helion_sparse_attention_forward_256(
     variable_block_sizes: Tensor,
     block_elements_in: int,
 ) -> tuple[Tensor, Tensor]:
-    """Apply logical-256 fine attention with physical Q256 x KV64 tiles.
+    """Apply logical-256 fine attention with autotuned physical Q/KV tiles.
 
-    The accumulator stays at the logical query-block width so each K/V tile is
-    loaded once for all 256 query rows.  Subtiling is used only while rescaling
-    that accumulator, which avoids materializing the full TMEM value in
-    registers without changing the attention tile.
+    Q128/Q256 and KV64/KV128 candidates trade K/V reuse against occupancy.
+    Subtiling is used only while rescaling the accumulator, avoiding a full
+    TMEM-to-register materialization.
     """
 
     query_tokens = q_in.size(-2)
@@ -185,8 +235,8 @@ def _helion_sparse_attention_forward_256(
         dtype=torch.float32,
     )
 
-    block_m = hl.register_block_size(block_elements)
-    block_n = hl.register_block_size(64)
+    block_m = hl.register_block_size(128, block_elements)
+    block_n = hl.register_block_size(64, 128)
     sparse_kv_tokens = topk * block_elements
     qk_scale = (1.0 / math.sqrt(head_dim)) * 1.4426950408889634
 
@@ -443,15 +493,18 @@ def _helion_sparse_attention_backward(
 
 
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[128, 64],
-        range_warp_specializes=[None, None],
-        range_multi_buffers=[None, None],
-        pid_type="flat",
-        indexing="pointer",
-        num_warps=4,
-        num_stages=1,
-    ),
+    configs=[
+        helion.Config(
+            block_sizes=[q_tile, kv_tile],
+            range_warp_specializes=[None, None],
+            range_multi_buffers=[None, None],
+            pid_type="flat",
+            indexing="pointer",
+            num_warps=warps,
+            num_stages=stages,
+        )
+        for q_tile, kv_tile, warps, stages in _HELION_DQ_256_SPECS
+    ],
     static_shapes=True,
 )
 def _helion_sparse_attention_dq_256(
@@ -465,13 +518,10 @@ def _helion_sparse_attention_dq_256(
     grad_out_in: Tensor,
     block_elements_in: int,
 ) -> tuple[Tensor, Tensor]:
-    """Compute delta and dQ using Q128 x KV64 tiles.
+    """Compute delta and dQ with bounded Q64/Q128 and KV64/KV128 tuning.
 
-    A logical query block is covered by two physical Q tiles.  Keeping the
-    dQ tile at 128 avoids simultaneously holding Q256-sized score,
-    probability, score-gradient, and dQ accumulator tensors in TMEM.  Each
-    physical Q tile exclusively owns its dQ and delta rows, so no atomics are
-    needed.
+    Each physical Q tile exclusively owns its dQ and delta rows, so no atomics
+    are needed.
     """
 
     query_tokens = q_in.size(-2)
@@ -509,8 +559,8 @@ def _helion_sparse_attention_dq_256(
         dtype=torch.float32,
     )
 
-    block_m = hl.register_block_size(128)
-    block_n = hl.register_block_size(64)
+    block_m = hl.register_block_size(64, 128)
+    block_n = hl.register_block_size(64, 128)
     sparse_kv_tokens = topk * block_elements
 
     sm_scale = 1.0 / math.sqrt(head_dim)
@@ -1408,6 +1458,31 @@ def _helion_sparse_attention(
     )[0]
 
 
+def helion_sparse_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    selected: Tensor,
+    variable_block_sizes: Tensor,
+    *,
+    block_size: int | tuple,
+) -> Tensor:
+    """Run only the Helion sparse executor on an externally supplied route."""
+
+    block_elements = _as_block_elements(block_size)
+    return _helion_sparse_attention(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        selected.to(device=q.device, dtype=torch.int32).contiguous(),
+        variable_block_sizes.to(
+            device=q.device,
+            dtype=torch.int32,
+        ).contiguous(),
+        block_elements,
+    )
+
+
 def helion_vsa(
     q: Tensor,
     k: Tensor,
@@ -1456,15 +1531,30 @@ def helion_vsa(
         dtype=torch.int32,
     ).contiguous()
 
-    scores, out_c = coarse_branch(
-        q,
-        k,
-        v,
-        variable_block_sizes,
-        q_variable_block_sizes,
-        block_elements,
-        scale,
-    )
+    use_fused_common = os.environ.get(
+        "SIMPLE_VSA_FUSED_COMMON", "1"
+    ) != "0"
+    if use_fused_common:
+        scores, out_c_blocks = coarse_branch_compact(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            variable_block_sizes,
+            q_variable_block_sizes,
+            block_elements,
+            scale,
+            block_mean_fn=fused_block_mean,
+        )
+    else:
+        scores, out_c = coarse_branch(
+            q,
+            k,
+            v,
+            variable_block_sizes,
+            q_variable_block_sizes,
+            block_elements,
+            scale,
+        )
     selected = scores.topk(topk, dim=-1, sorted=False).indices.to(
         dtype=torch.int32
     ).contiguous()
@@ -1477,6 +1567,13 @@ def helion_vsa(
         block_elements,
     )
 
+    if use_fused_common:
+        return fused_combine(
+            out_s,
+            out_c_blocks,
+            compress_attn_weight,
+            block_elements,
+        )
     if compress_attn_weight is None:
         output = out_c + out_s.float()
     else:

@@ -29,6 +29,7 @@ Shape symbols used in the inline annotations below:
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Optional, Tuple, Union
 
 import torch
@@ -133,6 +134,39 @@ def validate_vsa_inputs(
         raise ValueError(f"topk must be in [1, {kv_num_blocks}]")
 
 
+def coarse_branch_compact(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    variable_block_sizes: Tensor,
+    q_variable_block_sizes: Tensor,
+    block_elements: int,
+    scale: float,
+    *,
+    block_mean_fn: Callable[[Tensor, Tensor, int], Tensor] = block_mean,
+) -> Tuple[Tensor, Tensor]:
+    """Pooled scores and one compression vector per logical query block.
+
+    Keeping ``out_c_blocks`` compact avoids materializing the same compression
+    vector ``block_elements`` times. GPU backends can combine it with their
+    sparse output directly; :func:`coarse_branch` expands it for the readable
+    reference implementations.
+    """
+    q_c = block_mean_fn(q, q_variable_block_sizes, block_elements)
+    k_c = block_mean_fn(k, variable_block_sizes, block_elements)
+    v_c = block_mean_fn(v, variable_block_sizes, block_elements)
+
+    # [B,H,Qb,D] @ [B,H,D,Kb] -> [B, H, Qb, Kb]
+    # Match FastVideo's production path: block means are accumulated in fp32
+    # and written in the input dtype, then coarse attention stays in that dtype.
+    # In particular, BF16 routing must not silently become FP32 routing because
+    # that can change Top-K block selection near score ties.
+    scores = torch.matmul(q_c, k_c.transpose(-2, -1)) * scale
+    attn = torch.softmax(scores, dim=-1)                       # [B, H, Qb, Kb]
+    out_c_blocks = torch.matmul(attn, v_c)                     # [B,H,Qb,Kb] @ [B,H,Kb,D] -> [B, H, Qb, D]
+    return scores, out_c_blocks
+
+
 def coarse_branch(
     q: Tensor,
     k: Tensor,
@@ -142,31 +176,21 @@ def coarse_branch(
     block_elements: int,
     scale: float,
 ) -> Tuple[Tensor, Tensor]:
-    """Pooled block-vs-block scores and the dense compression output.
+    """Pooled block-vs-block scores and token-expanded compression output."""
 
-    Shared by ``video_sparse_attn``, ``torch_vsa`` and ``triton_vsa`` so the
-    compression branch is defined exactly once. Returns ``(scores, out_c)`` where
-    ``scores`` is ``[B, H, Qb, Kb]`` in the input dtype and feeds both the compression output
-    and the Top-K selection, and ``out_c`` is the compression attention output
-    broadcast back to every token, ``[B, H, Sq, D]`` in the input dtype.
-    """
-    batch, heads, q_seq_len, dim = q.shape                     # q: [B, H, Sq, D]
-    q_num_blocks = q_seq_len // block_elements                 # Qb = Sq / be
-
-    q_c = block_mean(q, q_variable_block_sizes, block_elements)  # [B, H, Qb, D]
-    k_c = block_mean(k, variable_block_sizes, block_elements)    # [B, H, Kb, D]
-    v_c = block_mean(v, variable_block_sizes, block_elements)    # [B, H, Kb, D]
-
-    # [B,H,Qb,D] @ [B,H,D,Kb] -> [B, H, Qb, Kb]
-    # Match FastVideo's production path: block means are accumulated in fp32
-    # and written in the input dtype, then coarse attention stays in that dtype.
-    # In particular, BF16 routing must not silently become FP32 routing because
-    # that can change Top-K block selection near score ties.
-    scores = torch.matmul(q_c, k_c.transpose(-2, -1)) * scale
-    attn = torch.softmax(scores, dim=-1)                       # [B, H, Qb, Kb]
-    out_c = torch.matmul(attn, v_c)                            # [B,H,Qb,Kb] @ [B,H,Kb,D] -> [B, H, Qb, D]
+    batch, heads, q_seq_len, dim = q.shape
+    q_num_blocks = q_seq_len // block_elements
+    scores, out_c_blocks = coarse_branch_compact(
+        q,
+        k,
+        v,
+        variable_block_sizes,
+        q_variable_block_sizes,
+        block_elements,
+        scale,
+    )
     out_c = (
-        out_c.view(batch, heads, q_num_blocks, 1, dim)         # [B, H, Qb, 1, D]
+        out_c_blocks.view(batch, heads, q_num_blocks, 1, dim)  # [B, H, Qb, 1, D]
         .expand(batch, heads, q_num_blocks, block_elements, dim)  # [B, H, Qb, be, D]
         .reshape(batch, heads, q_seq_len, dim)                 # [B, H, Sq, D]
     )

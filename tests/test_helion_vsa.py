@@ -3,7 +3,7 @@ import importlib.util
 import pytest
 import torch
 
-from vsa import helion_vsa, torch_vsa
+from vsa import helion_sparse_attention, helion_vsa, torch_vsa
 
 
 HAS_HELION = importlib.util.find_spec("helion") is not None
@@ -19,6 +19,37 @@ def _full_blocks(num_blocks, block_elements, device):
         dtype=torch.long,
         device=device,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_HELION, reason="Helion is not installed")
+def test_route_explicit_helion_executor_runs_backward():
+    torch.manual_seed(39)
+    be, nb, dim = 64, 3, 128
+    shape = (1, 1, be * nb, dim)
+    q = torch.randn(
+        shape, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    vbs = _full_blocks(nb, be, "cuda")
+    selected = torch.tensor(
+        [[[[0, 2], [1, 2], [0, 1]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    out = helion_sparse_attention(
+        q,
+        k,
+        v,
+        selected,
+        vbs,
+        block_size=(1, 1, be),
+    )
+    out.square().mean().backward()
+    for tensor in (q, k, v):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

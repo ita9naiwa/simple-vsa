@@ -10,7 +10,9 @@ from .torch_impl import torch_vsa
 __all__ = [
     "torch_vsa",
     "triton_vsa",
+    "triton_sparse_attention",
     "helion_vsa",
+    "helion_sparse_attention",
     "video_sparse_attn",
     "CompressionGate",
     "block_mean",
@@ -29,9 +31,23 @@ def triton_vsa(*args: Any, **kwargs: Any) -> Any:
     return implementation(*args, **kwargs)
 
 
+def triton_sparse_attention(*args: Any, **kwargs: Any) -> Any:
+    """Load the route-explicit Triton sparse executor on demand."""
+    from .triton_impl import triton_sparse_attention as _implementation
+
+    return _implementation(*args, **kwargs)
+
+
 def helion_vsa(*args: Any, **kwargs: Any) -> Any:
-    """Load the optional forward-only Helion implementation on demand."""
+    """Load the optional Helion implementation on demand."""
     from .helion_impl import helion_vsa as _helion_vsa
 
     implementation: Callable[..., Any] = _helion_vsa
     return implementation(*args, **kwargs)
+
+
+def helion_sparse_attention(*args: Any, **kwargs: Any) -> Any:
+    """Load the route-explicit Helion sparse executor on demand."""
+    from .helion_impl import helion_sparse_attention as _implementation
+
+    return _implementation(*args, **kwargs)

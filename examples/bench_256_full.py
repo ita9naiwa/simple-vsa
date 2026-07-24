@@ -2,7 +2,8 @@
 
 Same full VSA math (compression + sparse branch) at 256-token blocks, so all
 rows are apples-to-apples. Backends for the sparse branch:
-  - helion_vsa              : the readable simple-vsa Triton impl (fwd+bwd)
+  - triton_vsa              : the readable simple-vsa Triton impl (fwd+bwd)
+  - helion_vsa              : bounded Q/KV-tile autotuning (fwd+bwd)
   - fastvideo(triton)       : FastVideo route-A 256->64 Triton fallback (fwd+bwd)
   - fastvideo CuTe FA4      : FA4 CuTe 256x128, forward-only -> backward is X
 
@@ -13,6 +14,7 @@ its fwd+bwd / backward cells are marked "X". bf16, CUDA, batch=1, eager.
         python -u examples/bench_256_full.py
 """
 
+import importlib.util
 import math
 import os
 import time
@@ -83,12 +85,14 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
     kw = dict(topk=topk, block_size=(1, 1, BE))
 
     # (label, callable, backend-env-or-None, has_backward)
-    rows = [
-        ("helion_vsa", helion_vsa, None, True),
-        ("triton_vsa", triton_vsa, None, True)
-    ]
+    rows = [("triton_vsa", triton_vsa, None, True)]
+    if importlib.util.find_spec("helion") is not None:
+        rows.append(
+            ("helion_vsa autotuned", helion_vsa, None, True)
+        )
     if fvk_vsa is not None:
         rows.append(("fastvideo(triton) route-A 256->64", fvk_vsa, "triton", True))
+        rows.append(("fastvideo CuTe FA4 256x128", fvk_vsa, "cutedsl", False))
 
     print(f"\n### {name}", flush=True)
     print(

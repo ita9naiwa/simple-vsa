@@ -8,8 +8,8 @@ kernel differs:
                                64-token Triton block-sparse kernel.
   - FASTVIDEO_VSA_CUTEDSL=1  -> FA4 CuTe: logical Q256 routing with physical
                                KV128 blocks (forward only, Blackwell sm_100+).
-  - repo Helion              -> keeps logical-256 compact indices and computes
-                               them with physical Q128 x KV128 tiles.
+  - repo Triton              -> autotunes physical Q64/Q128/Q256 x KV64.
+  - repo Helion              -> autotunes physical Q128/Q256 x KV64/KV128.
 
 The backend is resolved from the env var at call time, so we flip it in-process
 between timing loops. bf16, CUDA, batch=1. Times are ms/iter (fwd only).
@@ -17,6 +17,7 @@ between timing loops. bf16, CUDA, batch=1. Times are ms/iter (fwd only).
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -u examples/bench_256_fwd.py
 """
 
+import argparse
 import math
 import os
 import time
@@ -25,6 +26,7 @@ import torch
 
 from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256
 from vsa.helion_impl import _helion_sparse_attention_forward_256
+from vsa.triton_impl import _triton_sparse_attention_forward
 
 BE = 256  # 256-token logical block
 
@@ -113,7 +115,24 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
 
     t, note = _time(helion_thunk, iters, warmup)
     cell = f"{t:.3f} ms" if t == t else (note or "n/a")
-    print(f"    {'repo Helion 256 (128x128)':<34}{cell:>16}", flush=True)
+    print(f"    {'repo Helion autotuned':<34}{cell:>16}", flush=True)
+
+    def triton_thunk():
+        with torch.no_grad():
+            outs["repo_triton"] = _triton_sparse_attention_forward(
+                q,
+                k,
+                v,
+                selected,
+                vbs,
+                block_size=BE,
+                sm_scale=dim**-0.5,
+                save_lse=False,
+            )[0]
+
+    t, note = _time(triton_thunk, iters, warmup)
+    cell = f"{t:.3f} ms" if t == t else (note or "n/a")
+    print(f"    {'repo Triton autotuned':<34}{cell:>16}", flush=True)
 
     if "cutedsl" in outs and outs["cutedsl"] is not None:
         for backend in ("triton", "helion"):
@@ -134,7 +153,31 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--shape",
+        choices=("all", "256px", "480p", "720p"),
+        default="all",
+        help="Run one shape to bound Triton and Helion autotuning time.",
+    )
+    args = parser.parse_args()
+
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}", flush=True)
-    run("Wan2.1  ~256px  (16k, 87.5% sparse)", nb=64, heads=12, dim=128, sparsity=0.875)
-    run("Wan2.1  480p 81f  (40k, 87.5% sparse)", nb=156, heads=12, dim=128, sparsity=0.875)
-    run("Wan2.1  720p 81f  (92k, 87.5% sparse)", nb=360, heads=12, dim=128, sparsity=0.875)
+    cases = {
+        "256px": ("Wan2.1  ~256px  (16k, 87.5% sparse)", 64),
+        "480p": ("Wan2.1  480p 81f  (40k, 87.5% sparse)", 156),
+        "720p": ("Wan2.1  720p 81f  (92k, 87.5% sparse)", 360),
+    }
+    selected_cases = (
+        cases.items()
+        if args.shape == "all"
+        else [(args.shape, cases[args.shape])]
+    )
+    for _, (name, nb) in selected_cases:
+        run(
+            name,
+            nb=nb,
+            heads=12,
+            dim=128,
+            sparsity=0.875,
+        )

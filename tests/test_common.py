@@ -14,6 +14,7 @@ from vsa import (
     untile,
     video_sparse_attn,
 )
+from vsa.common import coarse_branch_compact
 
 
 def _full_size_blocks(num_blocks, block_elements, device="cpu"):
@@ -85,6 +86,30 @@ def test_block_mean_ignores_padding_values():
     x[0, 0, 2:] = 999.0  # padding
     out = block_mean(x, torch.tensor([2]), block_elements=4)
     torch.testing.assert_close(out, torch.tensor([[[[2.0, 2.0]]]]))
+
+
+def test_compact_coarse_matches_expanded_branch():
+    torch.manual_seed(7)
+    be, nb, dim = 4, 3, 8
+    q = torch.randn(1, 2, be * nb, dim)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = torch.tensor([4, 3, 2])
+    scale = dim**-0.5
+
+    from vsa.common import coarse_branch
+
+    scores, expanded = coarse_branch(q, k, v, vbs, vbs, be, scale)
+    compact_scores, compact = coarse_branch_compact(
+        q, k, v, vbs, vbs, be, scale
+    )
+    reconstructed = (
+        compact[:, :, :, None, :]
+        .expand(-1, -1, -1, be, -1)
+        .reshape_as(expanded)
+    )
+    torch.testing.assert_close(compact_scores, scores)
+    torch.testing.assert_close(reconstructed, expanded)
 
 
 @pytest.mark.parametrize("be", [4, 8])

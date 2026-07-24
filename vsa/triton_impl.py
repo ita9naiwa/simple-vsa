@@ -13,6 +13,7 @@ branch provides custom Triton forward and backward kernels for Q, K, and V.
 """
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -20,7 +21,35 @@ from torch import Tensor
 import triton
 import triton.language as tl
 
-from .common import _as_block_elements, coarse_branch, validate_vsa_inputs
+from .common import (
+    _as_block_elements,
+    coarse_branch,
+    coarse_branch_compact,
+    validate_vsa_inputs,
+)
+from .fused_common import fused_block_mean, fused_combine
+
+
+def _tile_candidates(env_name: str, defaults: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.environ.get(env_name)
+    if value is None or value == "auto":
+        return defaults
+    tile = int(value)
+    if tile not in defaults:
+        raise ValueError(
+            f"{env_name} must be one of auto/{'/'.join(map(str, defaults))}"
+        )
+    return (tile,)
+
+
+_FWD_Q_TILES = _tile_candidates(
+    "SIMPLE_VSA_TRITON_FWD_Q_TILE",
+    (64, 128, 256),
+)
+_BWD_Q_TILES = _tile_candidates(
+    "SIMPLE_VSA_TRITON_BWD_Q_TILE",
+    (64, 128),
+)
 
 
 _AUTOTUNE_CONFIGS = [
@@ -30,9 +59,31 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 _AUTOTUNE_CONFIGS_256 = [
-    triton.Config({}, num_warps=warps, num_stages=stages)
-    for warps in (4, 8)
-    for stages in (2, 3, 4)
+    triton.Config(
+        {"Q_TILE": q_tile},
+        num_warps=warps,
+        num_stages=1,
+    )
+    for q_tile, warps in (
+        (64, 4),
+        (128, 4),
+        (128, 8),
+        (256, 4),
+        (256, 8),
+    )
+    if q_tile in _FWD_Q_TILES
+]
+
+_AUTOTUNE_DQ_256 = [
+    triton.Config({"Q_TILE": q_tile}, num_warps=warps, num_stages=1)
+    for q_tile, warps in ((64, 4), (128, 4), (128, 8))
+    if q_tile in _BWD_Q_TILES
+]
+
+_AUTOTUNE_DKDV_256 = [
+    triton.Config({"Q_TILE": q_tile}, num_warps=warps, num_stages=1)
+    for q_tile, warps in ((64, 4), (128, 4), (128, 8))
+    if q_tile in _BWD_Q_TILES
 ]
 
 
@@ -231,18 +282,22 @@ def _vsa_tiled_forward_256_kernel(
     BLOCK_D: tl.constexpr,
     TOPK: tl.constexpr,
     STORE_LSE: tl.constexpr,
+    Q_TILE: tl.constexpr,
 ):
-    """Logical-Q256 forward with physical Q256 x KV64 dot tiles."""
+    """Logical-Q256 forward with autotuned physical Q tiles and KV64."""
 
-    query_block = tl.program_id(0)
+    query_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
     batch = batch_head // HEADS
     head = batch_head % HEADS
+    q_subtiles = 256 // Q_TILE
+    query_block = query_subtile_pid // q_subtiles
+    query_subtile = query_subtile_pid - query_block * q_subtiles
 
-    rows = tl.arange(0, 256)
+    rows = tl.arange(0, Q_TILE)
     cols = tl.arange(0, 64)
     dims = tl.arange(0, BLOCK_D)
-    query_positions = query_block * 256 + rows
+    query_positions = query_block * 256 + query_subtile * Q_TILE + rows
 
     q_ptrs = (
         Q
@@ -251,86 +306,86 @@ def _vsa_tiled_forward_256_kernel(
         + query_positions[:, None] * stride_qs
         + dims[None, :] * stride_qd
     )
-    q_mask = (rows[:, None] < 256) & (dims[None, :] < HEAD_DIM)
+    q_mask = (rows[:, None] < Q_TILE) & (dims[None, :] < HEAD_DIM)
     query = tl.load(q_ptrs, mask=q_mask, other=0.0)
 
-    row_max = tl.full([256], -float("inf"), tl.float32)
-    row_sum = tl.zeros([256], dtype=tl.float32)
-    accumulator = tl.zeros([256, BLOCK_D], dtype=tl.float32)
+    row_max = tl.full([Q_TILE], -float("inf"), tl.float32)
+    row_sum = tl.zeros([Q_TILE], dtype=tl.float32)
+    accumulator = tl.zeros([Q_TILE, BLOCK_D], dtype=tl.float32)
 
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
 
-    # Each selected logical KV256 block is consumed as four KV64 tiles.
-    for sparse_tile in tl.range(0, TOPK * 4, loop_unroll_factor=1):
-        selected_slot = sparse_tile // 4
-        kv_subtile = sparse_tile - selected_slot * 4
+    # Hoist route metadata once, then consume the logical KV256 block as four
+    # physical KV64 tiles.
+    for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
         kv_block = tl.load(
             SELECTED + selected_base + selected_slot
         ).to(tl.int32)
         valid_kv_tokens = tl.load(
             KV_BLOCK_SIZES + kv_block
         ).to(tl.int32)
-        kv_offsets = kv_subtile * 64 + cols
-        kv_positions = kv_block * 256 + kv_offsets
+        for kv_subtile in tl.range(0, 4, loop_unroll_factor=1):
+            kv_offsets = kv_subtile * 64 + cols
+            kv_positions = kv_block * 256 + kv_offsets
 
-        k_ptrs = (
-            K
-            + batch.to(tl.int64) * stride_kb
-            + head.to(tl.int64) * stride_kh
-            + kv_positions[None, :] * stride_ks
-            + dims[:, None] * stride_kd
-        )
-        key = tl.load(
-            k_ptrs,
-            mask=(dims[:, None] < HEAD_DIM)
-            & (cols[None, :] < 64),
-            other=0.0,
-        )
+            k_ptrs = (
+                K
+                + batch.to(tl.int64) * stride_kb
+                + head.to(tl.int64) * stride_kh
+                + kv_positions[None, :] * stride_ks
+                + dims[:, None] * stride_kd
+            )
+            key = tl.load(
+                k_ptrs,
+                mask=(dims[:, None] < HEAD_DIM)
+                & (cols[None, :] < 64),
+                other=0.0,
+            )
 
-        scores = tl.dot(query, key).to(tl.float32) * scale
-        valid_scores = kv_offsets[None, :] < valid_kv_tokens
-        scores = tl.where(valid_scores, scores, -float("inf"))
+            scores = tl.dot(query, key).to(tl.float32) * scale
+            valid_scores = kv_offsets[None, :] < valid_kv_tokens
+            scores = tl.where(valid_scores, scores, -float("inf"))
 
-        tile_max = tl.max(scores, axis=1)
-        tile_has_value = tile_max != -float("inf")
-        new_max = tl.where(
-            tile_has_value,
-            tl.maximum(row_max, tile_max),
-            row_max,
-        )
-        safe_old_max = tl.where(tile_has_value, row_max, 0.0)
-        safe_new_max = tl.where(tile_has_value, new_max, 0.0)
-        alpha = tl.where(
-            tile_has_value,
-            tl.exp2((safe_old_max - safe_new_max) * log2e),
-            1.0,
-        )
-        probabilities = tl.where(
-            valid_scores,
-            tl.exp2((scores - safe_new_max[:, None]) * log2e),
-            0.0,
-        )
+            tile_max = tl.max(scores, axis=1)
+            tile_has_value = tile_max != -float("inf")
+            new_max = tl.where(
+                tile_has_value,
+                tl.maximum(row_max, tile_max),
+                row_max,
+            )
+            safe_old_max = tl.where(tile_has_value, row_max, 0.0)
+            safe_new_max = tl.where(tile_has_value, new_max, 0.0)
+            alpha = tl.where(
+                tile_has_value,
+                tl.exp2((safe_old_max - safe_new_max) * log2e),
+                1.0,
+            )
+            probabilities = tl.where(
+                valid_scores,
+                tl.exp2((scores - safe_new_max[:, None]) * log2e),
+                0.0,
+            )
 
-        row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
-        accumulator = accumulator * alpha[:, None]
+            row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
+            accumulator = accumulator * alpha[:, None]
 
-        v_ptrs = (
-            V
-            + batch.to(tl.int64) * stride_vb
-            + head.to(tl.int64) * stride_vh
-            + kv_positions[:, None] * stride_vs
-            + dims[None, :] * stride_vd
-        )
-        value = tl.load(
-            v_ptrs,
-            mask=(kv_offsets[:, None] < valid_kv_tokens)
-            & (dims[None, :] < HEAD_DIM),
-            other=0.0,
-        )
-        accumulator += tl.dot(probabilities.to(value.dtype), value)
-        row_max = new_max
+            v_ptrs = (
+                V
+                + batch.to(tl.int64) * stride_vb
+                + head.to(tl.int64) * stride_vh
+                + kv_positions[:, None] * stride_vs
+                + dims[None, :] * stride_vd
+            )
+            value = tl.load(
+                v_ptrs,
+                mask=(kv_offsets[:, None] < valid_kv_tokens)
+                & (dims[None, :] < HEAD_DIM),
+                other=0.0,
+            )
+            accumulator += tl.dot(probabilities.to(value.dtype), value)
+            row_max = new_max
 
     output = accumulator / row_sum[:, None]
     out_ptrs = (
@@ -343,7 +398,7 @@ def _vsa_tiled_forward_256_kernel(
     tl.store(
         out_ptrs,
         output,
-        mask=(rows[:, None] < 256)
+        mask=(rows[:, None] < Q_TILE)
         & (dims[None, :] < HEAD_DIM),
     )
 
@@ -416,13 +471,18 @@ def _triton_sparse_attention_forward(
     block_m = max(16, triton.next_power_of_2(block_size))
     block_n = block_m
     block_d = max(16, triton.next_power_of_2(head_dim))
-    grid = (query_blocks, batch * heads)
-
     forward_kernel = (
         _vsa_tiled_forward_256_kernel
         if block_size == 256
         else _vsa_tiled_forward_kernel
     )
+    if block_size == 256:
+        grid = lambda meta: (
+            query_blocks * (256 // meta["Q_TILE"]),
+            batch * heads,
+        )
+    else:
+        grid = (query_blocks, batch * heads)
     forward_kernel[grid](
         q,
         k,
@@ -664,6 +724,10 @@ def _delta_256_kernel(
     tl.store(DELTA + batch_head * Q_TOKENS + positions, delta)
 
 
+@triton.autotune(
+    configs=_AUTOTUNE_DQ_256,
+    key=["Q_TOKENS", "HEAD_DIM", "TOPK"],
+)
 @triton.jit
 def _vsa_dq_256_kernel(
     Q,
@@ -702,21 +766,23 @@ def _vsa_dq_256_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TOPK: tl.constexpr,
+    Q_TILE: tl.constexpr,
 ):
-    """Compute dQ for one Q64 quarter while consuming logical KV256 as KV64."""
+    """Compute dQ for an autotuned physical Q tile against logical KV256."""
 
     query_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
-    query_block = query_subtile_pid // 4
-    query_subtile = query_subtile_pid - query_block * 4
+    q_subtiles = 256 // Q_TILE
+    query_block = query_subtile_pid // q_subtiles
+    query_subtile = query_subtile_pid - query_block * q_subtiles
     batch = batch_head // HEADS
     head = batch_head % HEADS
 
-    rows = tl.arange(0, 64)
+    rows = tl.arange(0, Q_TILE)
     cols = tl.arange(0, 64)
     dims = tl.arange(0, BLOCK_D)
-    query_positions = query_block * 256 + query_subtile * 64 + rows
-    q_mask = (rows[:, None] < 64) & (dims[None, :] < HEAD_DIM)
+    query_positions = query_block * 256 + query_subtile * Q_TILE + rows
+    q_mask = (rows[:, None] < Q_TILE) & (dims[None, :] < HEAD_DIM)
 
     q_ptrs = (
         Q
@@ -737,53 +803,52 @@ def _vsa_dq_256_kernel(
     lse = tl.load(LSE + batch_head * Q_TOKENS + query_positions)
     delta = tl.load(DELTA + batch_head * Q_TOKENS + query_positions)
 
-    dq = tl.zeros([64, BLOCK_D], dtype=tl.float32)
+    dq = tl.zeros([Q_TILE, BLOCK_D], dtype=tl.float32)
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
 
-    for sparse_tile in tl.range(0, TOPK * 4, loop_unroll_factor=1):
-        selected_slot = sparse_tile // 4
-        kv_subtile = sparse_tile - selected_slot * 4
+    for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
         kv_block = tl.load(
             SELECTED + selected_base + selected_slot
         ).to(tl.int32)
         valid_kv_tokens = tl.load(
             KV_BLOCK_SIZES + kv_block
         ).to(tl.int32)
-        kv_offsets = kv_subtile * 64 + cols
-        kv_positions = kv_block * 256 + kv_offsets
+        for kv_subtile in tl.range(0, 4, loop_unroll_factor=1):
+            kv_offsets = kv_subtile * 64 + cols
+            kv_positions = kv_block * 256 + kv_offsets
 
-        k_ptrs = (
-            K
-            + batch.to(tl.int64) * stride_kb
-            + head.to(tl.int64) * stride_kh
-            + kv_positions[None, :] * stride_ks
-            + dims[:, None] * stride_kd
-        )
-        vt_ptrs = (
-            V
-            + batch.to(tl.int64) * stride_vb
-            + head.to(tl.int64) * stride_vh
-            + kv_positions[None, :] * stride_vs
-            + dims[:, None] * stride_vd
-        )
-        tile_mask = (dims[:, None] < HEAD_DIM) & (
-            cols[None, :] < 64
-        )
-        key_t = tl.load(k_ptrs, mask=tile_mask, other=0.0)
-        value_t = tl.load(vt_ptrs, mask=tile_mask, other=0.0)
+            k_ptrs = (
+                K
+                + batch.to(tl.int64) * stride_kb
+                + head.to(tl.int64) * stride_kh
+                + kv_positions[None, :] * stride_ks
+                + dims[:, None] * stride_kd
+            )
+            vt_ptrs = (
+                V
+                + batch.to(tl.int64) * stride_vb
+                + head.to(tl.int64) * stride_vh
+                + kv_positions[None, :] * stride_vs
+                + dims[:, None] * stride_vd
+            )
+            tile_mask = (dims[:, None] < HEAD_DIM) & (
+                cols[None, :] < 64
+            )
+            key_t = tl.load(k_ptrs, mask=tile_mask, other=0.0)
+            value_t = tl.load(vt_ptrs, mask=tile_mask, other=0.0)
 
-        scores = tl.dot(query, key_t).to(tl.float32) * scale
-        valid = kv_offsets[None, :] < valid_kv_tokens
-        probability = tl.where(
-            valid,
-            tl.exp2((scores - lse[:, None]) * log2e),
-            0.0,
-        )
-        dp = tl.dot(dout, value_t).to(tl.float32)
-        ds = probability * (dp - delta[:, None]) * scale
-        dq += tl.dot(ds.to(query.dtype), tl.trans(key_t))
+            scores = tl.dot(query, key_t).to(tl.float32) * scale
+            valid = kv_offsets[None, :] < valid_kv_tokens
+            probability = tl.where(
+                valid,
+                tl.exp2((scores - lse[:, None]) * log2e),
+                0.0,
+            )
+            dp = tl.dot(dout, value_t).to(tl.float32)
+            ds = probability * (dp - delta[:, None]) * scale
+            dq += tl.dot(ds.to(query.dtype), tl.trans(key_t))
 
     dq_ptrs = (
         DQ
@@ -1082,6 +1147,10 @@ def _vsa_dkdv_kernel(
     tl.store(dv_ptrs, dv, mask=kv_mask)
 
 
+@triton.autotune(
+    configs=_AUTOTUNE_DKDV_256,
+    key=["Q_TOKENS", "HEAD_DIM", "TOPK"],
+)
 @triton.jit
 def _vsa_dkdv_256_kernel(
     Q,
@@ -1125,10 +1194,12 @@ def _vsa_dkdv_256_kernel(
     HEADS,
     EDGES_PER_HEAD,
     SM_SCALE,
+    TOPK: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    Q_TILE: tl.constexpr,
 ):
-    """Own one KV64 quarter and accumulate dK/dV over routed Q64 tiles."""
+    """Own one KV64 quarter and consume autotuned physical Q tiles."""
 
     kv_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -1137,7 +1208,7 @@ def _vsa_dkdv_256_kernel(
     batch = batch_head // HEADS
     head = batch_head % HEADS
 
-    rows = tl.arange(0, 64)
+    rows = tl.arange(0, Q_TILE)
     cols = tl.arange(0, 64)
     dims = tl.arange(0, BLOCK_D)
     kv_offsets = kv_subtile * 64 + cols
@@ -1186,19 +1257,19 @@ def _vsa_dkdv_256_kernel(
             K2Q + inverse_row + query_slot
         ).to(tl.int32)
 
-        # Keep the four Q64 quarters sequential.  Unrolling them duplicates
+        # Keep the physical Q tiles sequential. Unrolling duplicates
         # score/probability/gradient tiles and can exceed Blackwell SMEM.
         for query_subtile in tl.range(
             0,
-            4,
+            256 // Q_TILE,
             loop_unroll_factor=1,
         ):
             query_positions = (
                 query_block * 256
-                + query_subtile * 64
+                + query_subtile * Q_TILE
                 + rows
             )
-            q_mask = (rows[:, None] < 64) & (
+            q_mask = (rows[:, None] < Q_TILE) & (
                 dims[None, :] < HEAD_DIM
             )
             q_ptrs = (
@@ -1347,7 +1418,10 @@ def _triton_sparse_attention_backward(
     dv = torch.empty_like(v)
 
     if block_size == 256:
-        dq_grid = (query_blocks * 4, batch * heads)
+        dq_grid = lambda meta: (
+            query_blocks * (256 // meta["Q_TILE"]),
+            batch * heads,
+        )
         _vsa_dq_256_kernel[dq_grid](
             q,
             k,
@@ -1371,8 +1445,6 @@ def _triton_sparse_attention_backward(
             HEAD_DIM=head_dim,
             BLOCK_D=block_d,
             TOPK=topk,
-            num_warps=4,
-            num_stages=1,
         )
 
         dkdv_grid = (key_blocks * 4, batch * heads)
@@ -1401,10 +1473,9 @@ def _triton_sparse_attention_backward(
             HEADS=heads,
             EDGES_PER_HEAD=query_blocks * topk,
             SM_SCALE=sm_scale,
+            TOPK=topk,
             HEAD_DIM=head_dim,
             BLOCK_D=block_d,
-            num_warps=4,
-            num_stages=1,
         )
     else:
         dq_grid = (query_blocks, batch * heads)
@@ -1571,6 +1642,35 @@ def _triton_sparse_attention(
     )[0]
 
 
+def triton_sparse_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    selected: Tensor,
+    variable_block_sizes: Tensor,
+    *,
+    block_size: int | tuple,
+    sm_scale: Optional[float] = None,
+) -> Tensor:
+    """Run only the Triton sparse executor on an externally supplied route.
+
+    This is the routing/fusion experimentation boundary. ``selected`` has shape
+    ``[batch, heads, query_blocks, topk]`` and may come from any policy.
+    """
+
+    block_elements = _as_block_elements(block_size)
+    scale = sm_scale if sm_scale is not None else 1.0 / math.sqrt(q.shape[-1])
+    return _triton_sparse_attention(
+        q,
+        k,
+        v,
+        selected,
+        variable_block_sizes,
+        block_size=block_elements,
+        sm_scale=scale,
+    )
+
+
 def triton_vsa(
     q: Tensor,
     k: Tensor,
@@ -1601,16 +1701,31 @@ def triton_vsa(
     variable_block_sizes = variable_block_sizes.to(q.device)
     q_variable_block_sizes = q_variable_block_sizes.to(q.device)
 
-    # scores: [B,H,Qb,Kb], out_c: [B,H,Sq,D].
-    scores, out_c = coarse_branch(
-        q,
-        k,
-        v,
-        variable_block_sizes,
-        q_variable_block_sizes,
-        block_elements,
-        scale,
-    )
+    use_fused_common = os.environ.get(
+        "SIMPLE_VSA_FUSED_COMMON", "1"
+    ) != "0"
+    if use_fused_common:
+        # Keep compression output compact until the final fused broadcast/add.
+        scores, out_c_blocks = coarse_branch_compact(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            variable_block_sizes,
+            q_variable_block_sizes,
+            block_elements,
+            scale,
+            block_mean_fn=fused_block_mean,
+        )
+    else:
+        scores, out_c = coarse_branch(
+            q,
+            k,
+            v,
+            variable_block_sizes,
+            q_variable_block_sizes,
+            block_elements,
+            scale,
+        )
     selected = scores.topk(topk, dim=-1, sorted=False).indices
     out_s = _triton_sparse_attention(
         q,
@@ -1622,6 +1737,13 @@ def triton_vsa(
         sm_scale=scale,
     )
 
+    if use_fused_common:
+        return fused_combine(
+            out_s,
+            out_c_blocks,
+            compress_attn_weight,
+            block_elements,
+        )
     if compress_attn_weight is None:
         output = out_c + out_s.float()
     else:

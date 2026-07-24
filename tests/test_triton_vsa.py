@@ -3,7 +3,7 @@ import importlib.util
 import pytest
 import torch
 
-from vsa import torch_vsa, triton_vsa
+from vsa import torch_vsa, triton_sparse_attention, triton_vsa
 
 
 HAS_TRITON = importlib.util.find_spec("triton") is not None
@@ -11,6 +11,139 @@ HAS_TRITON = importlib.util.find_spec("triton") is not None
 
 def _full_blocks(num_blocks, block_elements, device):
     return torch.full((num_blocks,), block_elements, dtype=torch.long, device=device)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not installed")
+def test_fused_block_mean_forward_and_backward_match_torch():
+    from vsa.common import block_mean
+    from vsa.fused_common import fused_block_mean
+
+    torch.manual_seed(11)
+    x = torch.randn(
+        1,
+        2,
+        3 * 64,
+        128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    vbs = torch.tensor([64, 37, 11], device="cuda")
+    grad = torch.randn(
+        1,
+        2,
+        3,
+        128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    reference = x.detach().clone().requires_grad_()
+    actual = x.detach().clone().requires_grad_()
+    expected_out = block_mean(reference, vbs, 64)
+    actual_out = fused_block_mean(actual, vbs, 64)
+    expected_out.backward(grad)
+    actual_out.backward(grad)
+    torch.testing.assert_close(actual_out, expected_out, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        actual.grad,
+        reference.grad,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not installed")
+@pytest.mark.parametrize("with_gate", [False, True])
+def test_fused_combine_forward_and_backward_match_torch(with_gate):
+    from vsa.fused_common import fused_combine
+
+    torch.manual_seed(13)
+    be, nb, dim = 64, 3, 128
+    sparse_data = torch.randn(
+        1, 2, be * nb, dim, device="cuda", dtype=torch.bfloat16
+    )
+    coarse_data = torch.randn(
+        1, 2, nb, dim, device="cuda", dtype=torch.bfloat16
+    )
+    gate_data = (
+        torch.randn_like(sparse_data)
+        if with_gate
+        else None
+    )
+    grad = torch.randn_like(sparse_data)
+
+    sparse_ref = sparse_data.detach().clone().requires_grad_()
+    coarse_ref = coarse_data.detach().clone().requires_grad_()
+    gate_ref = (
+        gate_data.detach().clone().requires_grad_()
+        if gate_data is not None
+        else None
+    )
+    sparse_actual = sparse_data.detach().clone().requires_grad_()
+    coarse_actual = coarse_data.detach().clone().requires_grad_()
+    gate_actual = (
+        gate_data.detach().clone().requires_grad_()
+        if gate_data is not None
+        else None
+    )
+
+    coarse_expanded = coarse_ref[:, :, :, None, :].expand(
+        -1, -1, -1, be, -1
+    ).reshape_as(sparse_ref)
+    expected = sparse_ref + (
+        coarse_expanded * gate_ref
+        if gate_ref is not None
+        else coarse_expanded
+    )
+    actual = fused_combine(
+        sparse_actual,
+        coarse_actual,
+        gate_actual,
+        be,
+    )
+    expected.backward(grad)
+    actual.backward(grad)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        sparse_actual.grad, sparse_ref.grad, atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        coarse_actual.grad, coarse_ref.grad, atol=3e-2, rtol=3e-2
+    )
+    if gate_ref is not None:
+        torch.testing.assert_close(
+            gate_actual.grad, gate_ref.grad, atol=3e-2, rtol=3e-2
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not installed")
+def test_route_explicit_triton_executor_matches_full_sparse_branch():
+    torch.manual_seed(15)
+    be, nb, dim = 64, 3, 128
+    shape = (1, 2, be * nb, dim)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = _full_blocks(nb, be, "cuda")
+    selected = torch.tensor(
+        [[[[0, 2], [1, 2], [0, 1]]] * 2],
+        device="cuda",
+        dtype=torch.int32,
+    ).reshape(1, 2, nb, 2)
+
+    actual = triton_sparse_attention(
+        q,
+        k,
+        v,
+        selected,
+        vbs,
+        block_size=(1, 1, be),
+    )
+    assert actual.shape == q.shape
+    assert torch.isfinite(actual).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
