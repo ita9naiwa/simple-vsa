@@ -1099,11 +1099,12 @@ def _vsa_dkdv_kernel(
             0.0,
         )
         dp = tl.dot(dout, tl.trans(value)).to(tl.float32)
-        ds = probability * (dp - delta[:, None]) * scale
+        ds = probability * (dp - delta[:, None])
 
         dk += tl.dot(tl.trans(ds.to(query.dtype)), query)
         dv += tl.dot(tl.trans(probability.to(dout.dtype)), dout)
 
+    dk *= scale
     dk_ptrs = (
         DK
         + batch.to(tl.int64) * stride_dkb
