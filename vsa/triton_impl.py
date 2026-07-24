@@ -1450,7 +1450,7 @@ def _triton_sparse_attention_backward(
             BLOCK_D=block_d,
             Q_TILE=128,
             num_warps=4,
-            num_stages=1,
+            num_stages=2,
         )
     else:
         dq_grid = (query_blocks, batch * heads)
