@@ -1515,7 +1515,7 @@ def _triton_sparse_attention_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            num_warps=8,
+            num_warps=4,
             num_stages=3,
         )
     return dq, dk, dv
