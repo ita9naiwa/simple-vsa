@@ -4,7 +4,6 @@ Same full VSA math (compression + sparse branch) at the native 64-token block
 (FastVideo's 4x4x4 tile volume), so all rows are apples-to-apples. The sparse
 branch dispatches on block_elements = prod(block_size) = 64, which is
 FastVideo's fallback 64-block path. Backends:
-  - helion_vsa              : the readable simple-vsa Helion impl (fwd+bwd)
   - triton_vsa              : the readable simple-vsa Triton impl (fwd+bwd)
   - fastvideo(triton) 64    : FastVideo block_sparse_attn 64 Triton fallback (fwd+bwd)
 
@@ -22,7 +21,7 @@ import time
 
 import torch
 
-from vsa import helion_vsa, triton_vsa
+from vsa import triton_vsa
 
 torch.set_float32_matmul_precision("high")
 
@@ -87,7 +86,6 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
 
     # (label, callable, backend-env-or-None, has_backward)
     rows = [
-        ("helion_vsa", helion_vsa, None, True),
         ("triton_vsa", triton_vsa, None, True),
     ]
     if fvk_vsa is not None:

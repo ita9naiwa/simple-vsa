@@ -17,18 +17,12 @@ Example:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import math
 import time
 
 import torch
 
-from vsa import (
-    helion_sparse_attention,
-    helion_vsa,
-    triton_sparse_attention,
-    triton_vsa,
-)
+from vsa import triton_sparse_attention, triton_vsa
 from vsa.common import coarse_branch, coarse_branch_compact
 from vsa.fused_common import fused_block_mean
 from vsa.triton_impl import _invert_indices
@@ -137,7 +131,6 @@ def run(shape_name, blocks, block_elements, route_kinds, iters, warmup):
         flush=True,
     )
 
-    has_helion = importlib.util.find_spec("helion") is not None
     for route_kind in route_kinds:
         selected = _routes(
             route_kind,
@@ -167,13 +160,9 @@ def run(shape_name, blocks, block_elements, route_kinds, iters, warmup):
             flush=True,
         )
 
-        backends = [
+        for backend_name, executor in [
             ("triton", triton_sparse_attention),
-        ]
-        if has_helion:
-            backends.append(("helion", helion_sparse_attention))
-
-        for backend_name, executor in backends:
+        ]:
             def fine_fwd():
                 with torch.no_grad():
                     executor(
@@ -215,10 +204,7 @@ def run(shape_name, blocks, block_elements, route_kinds, iters, warmup):
                 flush=True,
             )
 
-    full_backends = [("triton full", triton_vsa)]
-    if has_helion:
-        full_backends.append(("helion full", helion_vsa))
-    for label, fn in full_backends:
+    for label, fn in [("triton full", triton_vsa)]:
         fq = q.detach().requires_grad_()
         fk = k.detach().requires_grad_()
         fv = v.detach().requires_grad_()

@@ -9,7 +9,6 @@ kernel differs:
   - FASTVIDEO_VSA_CUTEDSL=1  -> FA4 CuTe: logical Q256 routing with physical
                                KV128 blocks (forward only, Blackwell sm_100+).
   - repo Triton              -> autotunes physical Q64/Q128/Q256 x KV64.
-  - repo Helion              -> autotunes physical Q128/Q256 x KV64/KV128.
 
 The backend is resolved from the env var at call time, so we flip it in-process
 between timing loops. bf16, CUDA, batch=1. Times are ms/iter (fwd only).
@@ -25,7 +24,6 @@ import time
 import torch
 
 from fastvideo_kernel.block_sparse_attn_256 import block_sparse_attn_256
-from vsa.helion_impl import _helion_sparse_attention_forward_256
 from vsa.triton_impl import _triton_sparse_attention_forward
 
 BE = 256  # 256-token logical block
@@ -102,21 +100,6 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
         cell = f"{t:.3f} ms" if t == t else (note or "n/a")
         print(f"    {label:<34}{cell:>16}", flush=True)
 
-    def helion_thunk():
-        with torch.no_grad():
-            outs["helion"] = _helion_sparse_attention_forward_256(
-                q,
-                k,
-                v,
-                selected,
-                vbs,
-                BE,
-            )[0]
-
-    t, note = _time(helion_thunk, iters, warmup)
-    cell = f"{t:.3f} ms" if t == t else (note or "n/a")
-    print(f"    {'repo Helion autotuned':<34}{cell:>16}", flush=True)
-
     def triton_thunk():
         with torch.no_grad():
             outs["repo_triton"] = _triton_sparse_attention_forward(
@@ -135,7 +118,7 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
     print(f"    {'repo Triton autotuned':<34}{cell:>16}", flush=True)
 
     if "cutedsl" in outs and outs["cutedsl"] is not None:
-        for backend in ("triton", "helion"):
+        for backend in ("triton",):
             if backend not in outs or outs[backend] is None:
                 continue
             d = (
@@ -158,7 +141,7 @@ if __name__ == "__main__":
         "--shape",
         choices=("all", "256px", "480p", "720p"),
         default="all",
-        help="Run one shape to bound Triton and Helion autotuning time.",
+        help="Run one shape to bound Triton autotuning time.",
     )
     args = parser.parse_args()
 
