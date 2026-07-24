@@ -36,6 +36,26 @@ _AUTOTUNE_CONFIGS = [
     for stages in (2, 3, 4)
 ]
 
+_AUTOTUNE_DQ_REGS_256 = [
+    triton.Config(
+        {},
+        num_warps=4,
+        num_stages=3,
+        maxnreg=maxnreg,
+    )
+    for maxnreg in (None, 80, 96, 128, 168)
+]
+
+_AUTOTUNE_DKDV_REGS_256 = [
+    triton.Config(
+        {},
+        num_warps=4,
+        num_stages=1,
+        maxnreg=maxnreg,
+    )
+    for maxnreg in (None, 80, 96, 128, 168)
+]
+
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
     key=["Q_TOKENS", "HEAD_DIM", "BLOCK_ELEMENTS", "TOPK", "STORE_LSE"],
@@ -675,6 +695,10 @@ def _delta_256_kernel(
     tl.store(DELTA + batch_head * Q_TOKENS + positions, delta)
 
 
+@triton.autotune(
+    configs=_AUTOTUNE_DQ_REGS_256,
+    key=["Q_TOKENS", "HEAD_DIM", "TOPK"],
+)
 @triton.jit
 def _vsa_dq_256_kernel(
     Q,
@@ -1097,6 +1121,10 @@ def _vsa_dkdv_kernel(
     tl.store(dv_ptrs, dv, mask=kv_mask)
 
 
+@triton.autotune(
+    configs=_AUTOTUNE_DKDV_REGS_256,
+    key=["Q_TOKENS", "HEAD_DIM", "TOPK"],
+)
 @triton.jit
 def _vsa_dkdv_256_kernel(
     Q,
@@ -1390,8 +1418,6 @@ def _triton_sparse_attention_backward(
             BLOCK_D=block_d,
             TOPK=topk,
             Q_TILE=128,
-            num_warps=4,
-            num_stages=3,
         )
 
         dkdv_grid = (key_blocks * 4, batch * heads)
@@ -1424,8 +1450,6 @@ def _triton_sparse_attention_backward(
             HEAD_DIM=head_dim,
             BLOCK_D=block_d,
             Q_TILE=128,
-            num_warps=4,
-            num_stages=1,
         )
     else:
         dq_grid = (query_blocks, batch * heads)
