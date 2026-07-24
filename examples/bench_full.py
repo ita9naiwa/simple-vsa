@@ -1,16 +1,19 @@
-"""VSA-256 fwd / fwd+bwd / bwd table across backends.
+"""VSA-64 fwd / fwd+bwd / bwd table across backends.
 
-Same full VSA math (compression + sparse branch) at 256-token blocks, so all
-rows are apples-to-apples. Backends for the sparse branch:
-  - helion_vsa              : the readable simple-vsa Triton impl (fwd+bwd)
-  - fastvideo(triton)       : FastVideo route-A 256->64 Triton fallback (fwd+bwd)
-  - fastvideo CuTe FA4      : FA4 CuTe 256x128, forward-only -> backward is X
+Same full VSA math (compression + sparse branch) at the native 64-token block
+(FastVideo's 4x4x4 tile volume), so all rows are apples-to-apples. The sparse
+branch dispatches on block_elements = prod(block_size) = 64, which is
+FastVideo's fallback 64-block path. Backends:
+  - helion_vsa              : the readable simple-vsa Helion impl (fwd+bwd)
+  - triton_vsa              : the readable simple-vsa Triton impl (fwd+bwd)
+  - fastvideo(triton) 64    : FastVideo block_sparse_attn 64 Triton fallback (fwd+bwd)
 
-Backward is reported as (fwd+bwd - fwd). CuTe has no block-sparse backward, so
-its fwd+bwd / backward cells are marked "X". bf16, CUDA, batch=1, eager.
+Backward is reported as (fwd+bwd - fwd). bf16, CUDA, batch=1, eager. Sequence
+lengths match examples/bench_256_full.py (16k / 40k / 92k) so the two tables can
+be read side by side.
 
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONWARNINGS=ignore \
-        python -u examples/bench_256_full.py
+        python -u examples/bench_full.py
 """
 
 import math
@@ -28,7 +31,7 @@ try:
 except Exception:  # noqa: BLE001
     fvk_vsa = None
 
-BE = 256  # 256-token logical block
+BE = 64  # 64-token native block (FastVideo 4x4x4 tile volume)
 
 
 def _time(thunk, iters, warmup):
@@ -85,10 +88,10 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
     # (label, callable, backend-env-or-None, has_backward)
     rows = [
         ("helion_vsa", helion_vsa, None, True),
-        ("triton_vsa", triton_vsa, None, True)
+        ("triton_vsa", triton_vsa, None, True),
     ]
     if fvk_vsa is not None:
-        rows.append(("fastvideo(triton) route-A 256->64", fvk_vsa, "triton", True))
+        rows.append(("fastvideo(triton) fallback 64", fvk_vsa, "triton", True))
 
     print(f"\n### {name}", flush=True)
     print(
@@ -122,6 +125,6 @@ def run(name, nb, heads, dim, sparsity, iters=30, warmup=15):
 
 if __name__ == "__main__":
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}", flush=True)
-    run("Wan2.1  ~256px  (16k, 87.5% sparse)", nb=64, heads=12, dim=128, sparsity=0.875)
-    run("Wan2.1  480p 81f  (40k, 87.5% sparse)", nb=156, heads=12, dim=128, sparsity=0.875)
-    run("Wan2.1  720p 81f  (92k, 87.5% sparse)", nb=360, heads=12, dim=128, sparsity=0.875)
+    run("Wan2.1  ~256px  (16k, 87.5% sparse)", nb=256, heads=12, dim=128, sparsity=0.875)
+    run("Wan2.1  480p 81f  (40k, 87.5% sparse)", nb=624, heads=12, dim=128, sparsity=0.875)
+    run("Wan2.1  720p 81f  (92k, 87.5% sparse)", nb=1440, heads=12, dim=128, sparsity=0.875)

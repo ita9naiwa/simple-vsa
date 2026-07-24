@@ -163,3 +163,93 @@ def test_triton_backward_matches_torch_with_padding_and_gate():
         atol=4e-2,
         rtol=4e-2,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not installed")
+def test_triton_256_forward_matches_torch_with_padding():
+    torch.manual_seed(33)
+    be, nb, dim = 256, 3, 128
+    shape = (1, 1, be * nb, dim)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    vbs = torch.tensor([256, 191, 73], device="cuda")
+
+    with torch.no_grad():
+        expected = torch_vsa(
+            q,
+            k,
+            v,
+            vbs,
+            vbs,
+            topk=2,
+            block_size=(1, 1, be),
+        )
+        actual = triton_vsa(
+            q,
+            k,
+            v,
+            vbs,
+            vbs,
+            topk=2,
+            block_size=(1, 1, be),
+        )
+
+    torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not installed")
+def test_triton_256_backward_matches_torch_with_padding():
+    torch.manual_seed(35)
+    be, nb, dim = 256, 2, 128
+    shape = (1, 1, be * nb, dim)
+    inputs = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    grad_output = torch.randn(
+        shape,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    vbs = torch.tensor([256, 173], device="cuda")
+
+    reference_inputs = [
+        x.detach().clone().requires_grad_() for x in inputs
+    ]
+    triton_inputs = [
+        x.detach().clone().requires_grad_() for x in inputs
+    ]
+
+    expected = torch_vsa(
+        *reference_inputs,
+        vbs,
+        vbs,
+        topk=2,
+        block_size=(1, 1, be),
+    )
+    actual = triton_vsa(
+        *triton_inputs,
+        vbs,
+        vbs,
+        topk=2,
+        block_size=(1, 1, be),
+    )
+
+    expected.backward(grad_output)
+    actual.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
+    for actual_input, expected_input in zip(
+        triton_inputs,
+        reference_inputs,
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_input.grad,
+            expected_input.grad,
+            atol=8e-2,
+            rtol=8e-2,
+        )
