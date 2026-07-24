@@ -54,14 +54,36 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 _AUTOTUNE_DQ_256 = [
-    triton.Config({"Q_TILE": q_tile}, num_warps=warps, num_stages=1)
-    for q_tile, warps in ((64, 4), (128, 4), (128, 8))
+    triton.Config(
+        {"Q_TILE": q_tile},
+        num_warps=warps,
+        num_stages=stages,
+    )
+    for q_tile, warps, stages in (
+        (64, 4, 1),
+        (64, 4, 2),
+        (128, 4, 1),
+        (128, 4, 2),
+        (128, 4, 3),
+        (128, 8, 1),
+    )
     if q_tile in _BWD_Q_TILES
 ]
 
 _AUTOTUNE_DKDV_256 = [
-    triton.Config({"Q_TILE": q_tile}, num_warps=warps, num_stages=1)
-    for q_tile, warps in ((64, 4), (128, 4), (128, 8))
+    triton.Config(
+        {"Q_TILE": q_tile},
+        num_warps=warps,
+        num_stages=stages,
+    )
+    for q_tile, warps, stages in (
+        (64, 4, 1),
+        (64, 4, 2),
+        (128, 4, 1),
+        (128, 4, 2),
+        (128, 4, 3),
+        (128, 8, 1),
+    )
     if q_tile in _BWD_Q_TILES
 ]
 
