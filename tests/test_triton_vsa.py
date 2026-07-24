@@ -97,11 +97,13 @@ def test_fused_combine_forward_and_backward_match_torch(with_gate):
         else None
     )
 
-    coarse_expanded = coarse_ref[:, :, :, None, :].expand(
+    # The fused kernel multiplies and reduces in FP32 before storing BF16.
+    # Mirror that accumulation order instead of using a BF16 autograd reduce.
+    coarse_expanded = coarse_ref.float()[:, :, :, None, :].expand(
         -1, -1, -1, be, -1
     ).reshape_as(sparse_ref)
-    expected = sparse_ref + (
-        coarse_expanded * gate_ref
+    expected = sparse_ref.float() + (
+        coarse_expanded * gate_ref.float()
         if gate_ref is not None
         else coarse_expanded
     )
@@ -111,7 +113,7 @@ def test_fused_combine_forward_and_backward_match_torch(with_gate):
         gate_actual,
         be,
     )
-    expected.backward(grad)
+    expected.backward(grad.float())
     actual.backward(grad)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
