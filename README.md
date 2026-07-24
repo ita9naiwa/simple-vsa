@@ -112,7 +112,9 @@ Q128 x KV64 forward and backward tiles. Logical-256
 Helion evaluates a bounded Q128/Q256 x KV64/KV128 forward config set.
 When FastVideo's optional FA4 CuTe dependencies are installed,
 `cute_triton_vsa` combines its faster 256-token forward with the same owned
-Triton backward; `triton_vsa` remains dependency-free and unchanged.
+Triton backward; `triton_vsa` remains dependency-free and unchanged. On B300
+at the benchmarked Wan2.1 shapes, pure Triton is better at 16k tokens while
+the hybrid wins at 40k and 92k.
 For reproducible one-config runs, set
 `SIMPLE_VSA_HELION_FWD_TILE=128x64|128x128|256x64|256x128`, or
 `SIMPLE_VSA_HELION_DQ_TILE=64x64|128x64|128x128` before importing `vsa`.
