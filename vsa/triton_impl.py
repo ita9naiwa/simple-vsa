@@ -1285,7 +1285,7 @@ def _vsa_dkdv_256_kernel(
             ).to(tl.float32)
             ds = probability * (
                 dp - delta[:, None]
-            ) * scale
+            )
 
             dk += tl.dot(
                 tl.trans(ds.to(query.dtype)),
@@ -1296,6 +1296,8 @@ def _vsa_dkdv_256_kernel(
                 dout,
             )
 
+    # dK is linear in the attention scale; apply it once after accumulation.
+    dk *= scale
     dk_ptrs = (
         DK
         + batch.to(tl.int64) * stride_dkb
