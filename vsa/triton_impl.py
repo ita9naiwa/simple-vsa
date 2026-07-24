@@ -481,6 +481,7 @@ def _count_inverse_indices_kernel(
     KV_BLOCKS,
     HEADS,
     TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
     """Count selected query blocks for every KV block."""
 
@@ -490,9 +491,18 @@ def _count_inverse_indices_kernel(
     batch_head = batch * HEADS + head
     query_row = (batch_head * Q_BLOCKS + query_block) * TOPK
 
-    for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
-        kv_block = tl.load(Q2K + query_row + selected_slot).to(tl.int32)
-        tl.atomic_add(K2Q_COUNT + batch_head * KV_BLOCKS + kv_block, 1)
+    selected_slots = tl.arange(0, BLOCK_TOPK)
+    selected_mask = selected_slots < TOPK
+    kv_blocks = tl.load(
+        Q2K + query_row + selected_slots,
+        mask=selected_mask,
+        other=0,
+    ).to(tl.int32)
+    tl.atomic_add(
+        K2Q_COUNT + batch_head * KV_BLOCKS + kv_blocks,
+        1,
+        mask=selected_mask,
+    )
 
 
 @triton.jit
@@ -505,6 +515,7 @@ def _scatter_inverse_indices_kernel(
     HEADS,
     EDGES_PER_HEAD,
     TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
     """Scatter query ids into compact CSR storage after prefix-summing counts."""
 
@@ -514,11 +525,20 @@ def _scatter_inverse_indices_kernel(
     batch_head = batch * HEADS + head
     query_row = (batch_head * Q_BLOCKS + query_block) * TOPK
 
-    for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
-        kv_block = tl.load(Q2K + query_row + selected_slot).to(tl.int32)
-        cursor_ptr = K2Q_CURSOR + batch_head * KV_BLOCKS + kv_block
-        edge_offset = tl.atomic_add(cursor_ptr, 1)
-        tl.store(K2Q + batch_head * EDGES_PER_HEAD + edge_offset, query_block)
+    selected_slots = tl.arange(0, BLOCK_TOPK)
+    selected_mask = selected_slots < TOPK
+    kv_blocks = tl.load(
+        Q2K + query_row + selected_slots,
+        mask=selected_mask,
+        other=0,
+    ).to(tl.int32)
+    cursor_ptrs = K2Q_CURSOR + batch_head * KV_BLOCKS + kv_blocks
+    edge_offsets = tl.atomic_add(cursor_ptrs, 1, mask=selected_mask)
+    tl.store(
+        K2Q + batch_head * EDGES_PER_HEAD + edge_offsets,
+        query_block,
+        mask=selected_mask,
+    )
 
 
 def _invert_indices(
@@ -533,6 +553,7 @@ def _invert_indices(
 
     batch, heads, query_blocks, topk = selected.shape
     selected = selected.to(torch.int32).contiguous()
+    block_topk = triton.next_power_of_2(topk)
     counts = torch.zeros(
         (batch, heads, key_blocks),
         device=selected.device,
@@ -546,6 +567,8 @@ def _invert_indices(
         KV_BLOCKS=key_blocks,
         HEADS=heads,
         TOPK=topk,
+        BLOCK_TOPK=block_topk,
+        num_warps=4,
     )
 
     # Exclusive prefix offsets for each KV block, relative to its batch/head.
@@ -566,6 +589,8 @@ def _invert_indices(
         HEADS=heads,
         EDGES_PER_HEAD=edges_per_head,
         TOPK=topk,
+        BLOCK_TOPK=block_topk,
+        num_warps=4,
     )
     return inverse, offsets, counts
 
