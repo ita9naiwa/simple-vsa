@@ -51,19 +51,6 @@ _BWD_Q_TILES = _tile_candidates(
     (64, 128),
 )
 
-# FastVideo's 64-token fallback keeps one owner program per logical block but
-# evaluates backward in two rectangular MMA tiles: 64x32 for dQ and 32x64 for
-# dK/dV.  This reduces the live score/probability tile without introducing
-# gradient atomics.  Keep the old square path available for B300 A/B testing.
-_BWD_MICROTILE_64 = int(
-    os.environ.get("SIMPLE_VSA_TRITON_BWD_MICROTILE_64", "32")
-)
-if _BWD_MICROTILE_64 not in (32, 64):
-    raise ValueError(
-        "SIMPLE_VSA_TRITON_BWD_MICROTILE_64 must be 32 or 64"
-    )
-
-
 _AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=warps, num_stages=stages)
     for warps in (4, 8)
@@ -957,18 +944,10 @@ def _vsa_dq_kernel(
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
 
-    kv_subtiles: tl.constexpr = BLOCK_ELEMENTS // BLOCK_N
-    for selected_subtile in tl.range(
-        0, TOPK * kv_subtiles, loop_unroll_factor=1
-    ):
-        selected_slot = selected_subtile // kv_subtiles
-        kv_subtile = selected_subtile % kv_subtiles
-        kv_block = tl.load(
-            SELECTED + selected_base + selected_slot
-        ).to(tl.int32)
+    for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
+        kv_block = tl.load(SELECTED + selected_base + selected_slot).to(tl.int32)
         valid_kv_tokens = tl.load(KV_BLOCK_SIZES + kv_block).to(tl.int32)
-        kv_offset = kv_subtile * BLOCK_N
-        kv_positions = kv_block * BLOCK_ELEMENTS + kv_offset + cols
+        kv_positions = kv_block * BLOCK_ELEMENTS + cols
 
         k_ptrs = (
             K
@@ -985,14 +964,14 @@ def _vsa_dq_kernel(
             + dims[:, None] * stride_vd
         )
         tile_mask = (dims[:, None] < HEAD_DIM) & (
-            cols[None, :] < BLOCK_N
+            cols[None, :] < BLOCK_ELEMENTS
         )
         key_t = tl.load(k_ptrs, mask=tile_mask, other=0.0)
         value_t = tl.load(vt_ptrs, mask=tile_mask, other=0.0)
 
         scores = tl.dot(query, key_t).to(tl.float32) * scale
         valid = (rows[:, None] < BLOCK_ELEMENTS) & (
-            (kv_offset + cols[None, :]) < valid_kv_tokens
+            cols[None, :] < valid_kv_tokens
         )
         probability = tl.where(
             valid,
@@ -1103,17 +1082,10 @@ def _vsa_dkdv_kernel(
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
 
-    query_subtiles: tl.constexpr = BLOCK_ELEMENTS // BLOCK_M
-    for query_subtile_slot in tl.range(
-        0, query_count * query_subtiles, loop_unroll_factor=1
-    ):
-        query_slot = query_subtile_slot // query_subtiles
-        query_subtile = query_subtile_slot % query_subtiles
+    for query_slot in tl.range(0, query_count, loop_unroll_factor=1):
         query_block = tl.load(K2Q + inverse_row + query_slot).to(tl.int32)
-        query_positions = (
-            query_block * BLOCK_ELEMENTS + query_subtile * BLOCK_M + rows
-        )
-        q_mask = (rows[:, None] < BLOCK_M) & (dims[None, :] < HEAD_DIM)
+        query_positions = query_block * BLOCK_ELEMENTS + rows
+        q_mask = (rows[:, None] < BLOCK_ELEMENTS) & (dims[None, :] < HEAD_DIM)
         q_ptrs = (
             Q
             + batch.to(tl.int64) * stride_qb
@@ -1505,7 +1477,6 @@ def _triton_sparse_attention_backward(
             BLOCK_D=block_d,
         )
     else:
-        backward_microtile = _BWD_MICROTILE_64
         dq_grid = (query_blocks, batch * heads)
         _vsa_dq_kernel[dq_grid](
             q,
@@ -1530,7 +1501,7 @@ def _triton_sparse_attention_backward(
             HEAD_DIM=head_dim,
             BLOCK_ELEMENTS=block_size,
             BLOCK_M=block_m,
-            BLOCK_N=backward_microtile,
+            BLOCK_N=block_n,
             BLOCK_D=block_d,
             TOPK=topk,
             num_warps=4,
@@ -1565,7 +1536,7 @@ def _triton_sparse_attention_backward(
             SM_SCALE=sm_scale,
             HEAD_DIM=head_dim,
             BLOCK_ELEMENTS=block_size,
-            BLOCK_M=backward_microtile,
+            BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
             num_warps=4,
