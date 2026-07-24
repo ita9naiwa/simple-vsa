@@ -1104,6 +1104,7 @@ def _vsa_dkdv_kernel(
         dk += tl.dot(tl.trans(ds.to(query.dtype)), query)
         dv += tl.dot(tl.trans(probability.to(dout.dtype)), dout)
 
+    # dK is linear in the attention scale; apply it once after accumulation.
     dk *= scale
     dk_ptrs = (
         DK
