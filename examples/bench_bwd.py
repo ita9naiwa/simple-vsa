@@ -75,7 +75,7 @@ def run(name, nb, heads, dim, sparsity, be=64, iters=30, warmup=15):
 
     impls = [("triton_vsa", triton_vsa)]
     if real_vsa is not None:
-        impls.append(("thunderkittens", real_vsa))
+        impls.append(("fastvideo(triton)", real_vsa))
 
     print(f"\n### {name}", flush=True)
     print(
@@ -86,7 +86,7 @@ def run(name, nb, heads, dim, sparsity, be=64, iters=30, warmup=15):
         flush=True,
     )
     print(
-        f"    {'implementation / mode':<28}{'forward':>16}"
+        f"    {'implementation / mode':<30}{'forward':>16}"
         f"{'forward+backward':>20}{'backward':>16}",
         flush=True,
     )
@@ -100,7 +100,7 @@ def run(name, nb, heads, dim, sparsity, be=64, iters=30, warmup=15):
             t_f, n_f = bench_fwd(f, q, k, v, vbs, kw, iters, warmup)
             t_fb, n_fb = bench_fwd_bwd(f, q, k, v, vbs, kw, do, iters, warmup)
             t_b = (t_fb - t_f) if (t_f == t_f and t_fb == t_fb) else float("nan")
-            print(f"    {label + ' (' + mode + ')':<28}"
+            print(f"    {label + ' (' + mode + ')':<30}"
                   f"{cell(t_f, n_f):>16}{cell(t_fb, n_fb):>20}{cell(t_b, n_fb):>16}",
                   flush=True)
 
