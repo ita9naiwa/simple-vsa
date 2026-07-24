@@ -1,14 +1,16 @@
-# Simple VSA: PyTorch + Triton
+# Simple VSA: PyTorch + Triton + Helion
 
 This repository is a small, readable implementation of Video Sparse Attention
 (VSA). It follows the exact math and API of
 [`fastvideo_kernel.ops.video_sparse_attn`](https://github.com/hao-ai-lab/FastVideo),
-in three forms:
+in four forms:
 
 - `video_sparse_attn`: faithful PyTorch reference (masked-fill sparse branch).
 - `torch_vsa`: same math, but the sparse branch *gathers* only the selected
   blocks (real sparse work); CPU/CUDA, fully differentiable.
 - `triton_vsa`: CUDA forward kernel for the sparse branch with online softmax.
+- `helion_vsa`: forward-only Helion sparse kernel using indirect KV-block
+  gathers and online softmax.
 
 Each token stream is split into padded blocks (a 1D block stands in for a 3D
 spatiotemporal tile). The two branches are summed per token:
@@ -39,13 +41,20 @@ pip install -e '.[gpu,test]'
 pytest -q tests/test_triton_vsa.py
 ```
 
+For the forward-only Helion path:
+
+```bash
+pip install -e '.[helion,test]'
+pytest -q tests/test_helion_vsa.py
+```
+
 ## API
 
-All three functions share the FastVideo signature and accept
+All four functions share the FastVideo signature and accept
 `[batch, heads, seq_len, head_dim]` tensors:
 
 ```python
-from vsa import torch_vsa, triton_vsa
+from vsa import helion_vsa, torch_vsa, triton_vsa
 
 # valid token count per kv / query block (blocks are padded to block_size volume)
 variable_block_sizes = torch.full((num_blocks,), block_elements, dtype=torch.long)
@@ -63,6 +72,9 @@ with torch.no_grad():
     out_gpu = triton_vsa(q.cuda(), k.cuda(), v.cuda(),
                          variable_block_sizes.cuda(), variable_block_sizes.cuda(),
                          topk=2, block_size=(1, 1, block_elements))
+    out_helion = helion_vsa(q.cuda(), k.cuda(), v.cuda(),
+                            variable_block_sizes.cuda(), variable_block_sizes.cuda(),
+                            topk=2, block_size=(1, 1, block_elements))
 ```
 
 `seq_len` must be divisible by `block_elements = prod(block_size)` and
@@ -70,6 +82,11 @@ with torch.no_grad():
 scale is fixed at `1/sqrt(head_dim)`. The Triton path supports autograd for
 `q`, `k`, and `v` through custom backward kernels (Top-K routing remains
 discrete), and supports head dimensions up to 256.
+
+`helion_vsa` currently supports forward inference only, block volumes up to 128,
+and head dimensions up to 256. Its coarse branch and Top-K routing reuse the
+shared PyTorch implementation; Helion compiles the sparse fine branch to one GPU
+kernel without materializing gathered K/V blocks.
 
 ## References
 

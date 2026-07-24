@@ -5,13 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-vsa"
 version = "0.1.0"
-description = "Small educational Video Sparse Attention implementations in PyTorch and Triton"
+description = "Small educational Video Sparse Attention implementations in PyTorch, Triton, and Helion"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["torch>=2.4"]
 
 [project.optional-dependencies]
 gpu = ["triton>=3.0; platform_system == 'Linux'"]
+helion = [
+    "helion>=1.2; platform_system == 'Linux'",
+    "torch>=2.9; platform_system == 'Linux'",
+    "triton>=3.5; platform_system == 'Linux'",
+]
 test = ["pytest>=8"]
 
 [tool.setuptools.packages.find]

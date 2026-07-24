@@ -10,6 +10,7 @@ from .torch_impl import torch_vsa
 __all__ = [
     "torch_vsa",
     "triton_vsa",
+    "helion_vsa",
     "video_sparse_attn",
     "CompressionGate",
     "block_mean",
@@ -27,3 +28,10 @@ def triton_vsa(*args: Any, **kwargs: Any) -> Any:
     implementation: Callable[..., Any] = _triton_vsa
     return implementation(*args, **kwargs)
 
+
+def helion_vsa(*args: Any, **kwargs: Any) -> Any:
+    """Load the optional forward-only Helion implementation on demand."""
+    from .helion_impl import helion_vsa as _helion_vsa
+
+    implementation: Callable[..., Any] = _helion_vsa
+    return implementation(*args, **kwargs)
