@@ -165,17 +165,13 @@ def test_route_explicit_triton_executor_matches_full_sparse_branch():
 def test_inverse_indices_use_compact_edge_storage():
     from vsa.triton_impl import _invert_indices
 
-    selected = torch.tensor(
-        [
-            [
-                [[0, 2], [1, 2], [0, 3]],
-                [[3, 1], [1, 0], [2, 3]],
-            ]
-        ],
-        device="cuda",
-        dtype=torch.int32,
+    torch.manual_seed(17)
+    key_blocks = 13
+    selected = (
+        torch.randn(2, 3, 7, key_blocks, device="cuda")
+        .topk(5, dim=-1, sorted=False)
+        .indices.to(torch.int32)
     )
-    key_blocks = 4
     inverse, offsets, counts = _invert_indices(selected, key_blocks)
 
     # Storage is one int per selected edge, not a dense [Kb, Qb] table.
