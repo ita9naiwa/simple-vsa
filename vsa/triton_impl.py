@@ -1033,6 +1033,7 @@ def _vsa_dkdv_kernel(
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
     qk_scale = scale * log2e
+    key_scaled = (key * qk_scale).to(key.dtype)
 
     for query_slot in tl.range(0, query_count, loop_unroll_factor=1):
         query_block = tl.load(K2Q + inverse_row + query_slot).to(tl.int32)
@@ -1195,7 +1196,6 @@ def _vsa_dkdv_256_kernel(
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
     qk_scale = scale * log2e
-    key_scaled = (key * qk_scale).to(key.dtype)
 
     for query_slot in tl.range(
         0,
