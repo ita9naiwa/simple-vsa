@@ -786,9 +786,8 @@ def _vsa_dq_256_kernel(
             )
             key_t = tl.load(k_ptrs, mask=tile_mask, other=0.0)
             value_t = tl.load(vt_ptrs, mask=tile_mask, other=0.0)
-            key_t_scaled = (key_t * qk_scale).to(query.dtype)
 
-            scores = tl.dot(query, key_t_scaled).to(tl.float32)
+            scores = tl.dot(query, key_t).to(tl.float32) * qk_scale
             valid = kv_offsets[None, :] < valid_kv_tokens
             probability = tl.where(
                 valid,
@@ -796,8 +795,8 @@ def _vsa_dq_256_kernel(
                 0.0,
             )
             dp = tl.dot(dout, value_t).to(tl.float32)
-            ds = probability * (dp - delta[:, None])
-            dq += tl.dot(ds.to(query.dtype), tl.trans(key_t_scaled))
+            ds = probability * (dp - delta[:, None]) * scale
+            dq += tl.dot(ds.to(query.dtype), tl.trans(key_t))
 
     dq_ptrs = (
         DQ
@@ -806,7 +805,7 @@ def _vsa_dq_256_kernel(
         + query_positions[:, None] * stride_dqs
         + dims[None, :] * stride_dqd
     )
-    tl.store(dq_ptrs, dq * 0.6931471805599453, mask=q_mask)
+    tl.store(dq_ptrs, dq, mask=q_mask)
 
 
 @triton.jit
@@ -1033,7 +1032,6 @@ def _vsa_dkdv_kernel(
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
     qk_scale = scale * log2e
-    key_scaled = (key * qk_scale).to(key.dtype)
 
     for query_slot in tl.range(0, query_count, loop_unroll_factor=1):
         query_block = tl.load(K2Q + inverse_row + query_slot).to(tl.int32)
@@ -1245,7 +1243,8 @@ def _vsa_dkdv_256_kernel(
             )
 
             scores = (
-                tl.dot(query, tl.trans(key_scaled)).to(tl.float32)
+                tl.dot(query, tl.trans(key)).to(tl.float32)
+                * qk_scale
             )
             valid = kv_offsets[None, :] < valid_kv_tokens
             probability = tl.where(
@@ -1259,7 +1258,7 @@ def _vsa_dkdv_256_kernel(
             ).to(tl.float32)
             ds = probability * (
                 dp - delta[:, None]
-            )
+            ) * scale
 
             dk += tl.dot(
                 tl.trans(ds.to(query.dtype)),
@@ -1284,7 +1283,7 @@ def _vsa_dkdv_256_kernel(
         + kv_positions[:, None] * stride_dvs
         + dims[None, :] * stride_dvd
     )
-    tl.store(dk_ptrs, dk * scale, mask=kv_mask)
+    tl.store(dk_ptrs, dk, mask=kv_mask)
     tl.store(dv_ptrs, dv, mask=kv_mask)
 
 
