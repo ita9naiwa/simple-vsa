@@ -162,6 +162,7 @@ def _vsa_tiled_forward_kernel(
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
+    qk_scale = scale * log2e
 
     # Keep the indirect Top-K loop compact. In particular, do not expand
     # TOPK*BLOCK_ELEMENTS copies as the old nested static_range kernel did.
@@ -183,7 +184,7 @@ def _vsa_tiled_forward_kernel(
         key = tl.load(k_ptrs, mask=k_mask, other=0.0)
 
         # [BLOCK_M,D] @ [D,BLOCK_N] -> [BLOCK_M,BLOCK_N].
-        scores = tl.dot(query, key).to(tl.float32) * scale
+        scores = tl.dot(query, key).to(tl.float32) * qk_scale
         valid_scores = cols[None, :] < valid_kv_tokens
         scores = tl.where(valid_scores, scores, -float("inf"))
 
@@ -199,12 +200,12 @@ def _vsa_tiled_forward_kernel(
         safe_new_max = tl.where(tile_has_value, new_max, 0.0)
         alpha = tl.where(
             tile_has_value,
-            tl.exp2((safe_old_max - safe_new_max) * log2e),
+            tl.exp2(safe_old_max - safe_new_max),
             1.0,
         )
         probabilities = tl.where(
             valid_scores,
-            tl.exp2((scores - safe_new_max[:, None]) * log2e),
+            tl.exp2(scores - safe_new_max[:, None]),
             0.0,
         )
 
@@ -236,7 +237,7 @@ def _vsa_tiled_forward_kernel(
     tl.store(out_ptrs, output, mask=out_mask)
 
     if STORE_LSE:
-        lse = row_max + tl.log(row_sum)
+        lse = row_max + tl.log2(row_sum)
         lse_ptrs = LSE + batch_head * Q_TOKENS + query_positions
         tl.store(lse_ptrs, lse, mask=rows < BLOCK_ELEMENTS)
 
@@ -315,6 +316,7 @@ def _vsa_tiled_forward_256_kernel(
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
+    qk_scale = scale * log2e
 
     # Hoist route metadata once, then consume the logical KV256 block as four
     # physical KV64 tiles.
@@ -343,7 +345,7 @@ def _vsa_tiled_forward_256_kernel(
                 other=0.0,
             )
 
-            scores = tl.dot(query, key).to(tl.float32) * scale
+            scores = tl.dot(query, key).to(tl.float32) * qk_scale
             valid_scores = kv_offsets[None, :] < valid_kv_tokens
             scores = tl.where(valid_scores, scores, -float("inf"))
 
@@ -358,12 +360,12 @@ def _vsa_tiled_forward_256_kernel(
             safe_new_max = tl.where(tile_has_value, new_max, 0.0)
             alpha = tl.where(
                 tile_has_value,
-                tl.exp2((safe_old_max - safe_new_max) * log2e),
+                tl.exp2(safe_old_max - safe_new_max),
                 1.0,
             )
             probabilities = tl.where(
                 valid_scores,
-                tl.exp2((scores - safe_new_max[:, None]) * log2e),
+                tl.exp2(scores - safe_new_max[:, None]),
                 0.0,
             )
 
@@ -402,7 +404,7 @@ def _vsa_tiled_forward_256_kernel(
     )
 
     if STORE_LSE:
-        lse = row_max + tl.log(row_sum)
+        lse = row_max + tl.log2(row_sum)
         lse_ptrs = LSE + batch_head * Q_TOKENS + query_positions
         tl.store(lse_ptrs, lse)
 
@@ -806,6 +808,7 @@ def _vsa_dq_256_kernel(
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
+    qk_scale = scale * log2e
 
     for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
         kv_block = tl.load(
@@ -838,11 +841,11 @@ def _vsa_dq_256_kernel(
             key_t = tl.load(k_ptrs, mask=tile_mask, other=0.0)
             value_t = tl.load(vt_ptrs, mask=tile_mask, other=0.0)
 
-            scores = tl.dot(query, key_t).to(tl.float32) * scale
+            scores = tl.dot(query, key_t).to(tl.float32) * qk_scale
             valid = kv_offsets[None, :] < valid_kv_tokens
             probability = tl.where(
                 valid,
-                tl.exp2((scores - lse[:, None]) * log2e),
+                tl.exp2(scores - lse[:, None]),
                 0.0,
             )
             dp = tl.dot(dout, value_t).to(tl.float32)
@@ -943,6 +946,7 @@ def _vsa_dq_kernel(
     selected_base = (batch_head * Q_BLOCKS + query_block) * TOPK
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
+    qk_scale = scale * log2e
 
     for selected_slot in tl.range(0, TOPK, loop_unroll_factor=1):
         kv_block = tl.load(SELECTED + selected_base + selected_slot).to(tl.int32)
@@ -969,13 +973,13 @@ def _vsa_dq_kernel(
         key_t = tl.load(k_ptrs, mask=tile_mask, other=0.0)
         value_t = tl.load(vt_ptrs, mask=tile_mask, other=0.0)
 
-        scores = tl.dot(query, key_t).to(tl.float32) * scale
+        scores = tl.dot(query, key_t).to(tl.float32) * qk_scale
         valid = (rows[:, None] < BLOCK_ELEMENTS) & (
             cols[None, :] < valid_kv_tokens
         )
         probability = tl.where(
             valid,
-            tl.exp2((scores - lse[:, None]) * log2e),
+            tl.exp2(scores - lse[:, None]),
             0.0,
         )
         dp = tl.dot(dout, value_t).to(tl.float32)
@@ -1081,6 +1085,7 @@ def _vsa_dkdv_kernel(
     query_count = tl.load(K2Q_COUNT + metadata_offset)
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
+    qk_scale = scale * log2e
 
     for query_slot in tl.range(0, query_count, loop_unroll_factor=1):
         query_block = tl.load(K2Q + inverse_row + query_slot).to(tl.int32)
@@ -1113,13 +1118,13 @@ def _vsa_dkdv_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(query, tl.trans(key)).to(tl.float32) * scale
+        scores = tl.dot(query, tl.trans(key)).to(tl.float32) * qk_scale
         valid = (rows[:, None] < BLOCK_ELEMENTS) & (
             cols[None, :] < valid_kv_tokens
         )
         probability = tl.where(
             valid,
-            tl.exp2((scores - lse[:, None]) * log2e),
+            tl.exp2(scores - lse[:, None]),
             0.0,
         )
         dp = tl.dot(dout, tl.trans(value)).to(tl.float32)
@@ -1246,6 +1251,7 @@ def _vsa_dkdv_256_kernel(
     query_count = tl.load(K2Q_COUNT + metadata_offset)
     log2e: tl.constexpr = 1.4426950408889634
     scale = SM_SCALE.to(tl.float32)
+    qk_scale = scale * log2e
 
     for query_slot in tl.range(
         0,
@@ -1296,12 +1302,12 @@ def _vsa_dkdv_256_kernel(
 
             scores = (
                 tl.dot(query, tl.trans(key)).to(tl.float32)
-                * scale
+                * qk_scale
             )
             valid = kv_offsets[None, :] < valid_kv_tokens
             probability = tl.where(
                 valid,
-                tl.exp2((scores - lse[:, None]) * log2e),
+                tl.exp2(scores - lse[:, None]),
                 0.0,
             )
             dp = tl.dot(
