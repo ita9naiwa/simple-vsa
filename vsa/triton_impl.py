@@ -820,9 +820,11 @@ def _vsa_dq_256_kernel(
                 0.0,
             )
             dp = tl.dot(dout, value_t).to(tl.float32)
-            ds = probability * (dp - delta[:, None]) * scale
+            ds = probability * (dp - delta[:, None])
             dq += tl.dot(ds.to(query.dtype), tl.trans(key_t))
 
+    # dQ is linear in the attention scale; apply it once after accumulation.
+    dq *= scale
     dq_ptrs = (
         DQ
         + batch.to(tl.int64) * stride_dqb
@@ -954,9 +956,11 @@ def _vsa_dq_kernel(
             0.0,
         )
         dp = tl.dot(dout, value_t).to(tl.float32)
-        ds = probability * (dp - delta[:, None]) * scale
+        ds = probability * (dp - delta[:, None])
         dq += tl.dot(ds.to(query.dtype), tl.trans(key_t))
 
+    # dQ is linear in the attention scale; apply it once after accumulation.
+    dq *= scale
     dq_ptrs = (
         DQ
         + batch.to(tl.int64) * stride_dqb
