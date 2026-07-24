@@ -110,7 +110,8 @@ broadcast/add by default. Set `SIMPLE_VSA_FUSED_COMMON=0` to run the readable
 eager common path for A/B validation. Logical-256 Triton uses B300-tuned
 Q128 x KV64 forward and backward tiles. Its backward route inversion builds
 compact CSR metadata with vectorized GPU count/scatter kernels, without a
-dense key-block-by-query-block table. Logical-256
+dense key-block-by-query-block table. The 64-token backward uses an
+eight-warp dQ launch on B300. Logical-256
 Helion evaluates a bounded Q128/Q256 x KV64/KV128 forward config set.
 When FastVideo's optional FA4 CuTe dependencies are installed,
 `cute_triton_vsa` combines its faster 256-token forward with the same owned
