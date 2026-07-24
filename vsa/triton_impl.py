@@ -30,63 +30,11 @@ from .common import (
 from .fused_common import fused_block_mean, fused_combine
 
 
-def _tile_candidates(env_name: str, defaults: tuple[int, ...]) -> tuple[int, ...]:
-    value = os.environ.get(env_name)
-    if value is None or value == "auto":
-        return defaults
-    tile = int(value)
-    if tile not in defaults:
-        raise ValueError(
-            f"{env_name} must be one of auto/{'/'.join(map(str, defaults))}"
-        )
-    return (tile,)
-
-
-_BWD_Q_TILES = _tile_candidates(
-    "SIMPLE_VSA_TRITON_BWD_Q_TILE",
-    (64, 128),
-)
-
 _AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=warps, num_stages=stages)
     for warps in (4, 8)
     for stages in (2, 3, 4)
 ]
-
-_AUTOTUNE_DQ_256 = [
-    triton.Config(
-        {"Q_TILE": q_tile},
-        num_warps=warps,
-        num_stages=stages,
-    )
-    for q_tile, warps, stages in (
-        (64, 4, 1),
-        (64, 4, 2),
-        (128, 4, 1),
-        (128, 4, 2),
-        (128, 4, 3),
-        (128, 8, 1),
-    )
-    if q_tile in _BWD_Q_TILES
-]
-
-_AUTOTUNE_DKDV_256 = [
-    triton.Config(
-        {"Q_TILE": q_tile},
-        num_warps=warps,
-        num_stages=stages,
-    )
-    for q_tile, warps, stages in (
-        (64, 4, 1),
-        (64, 4, 2),
-        (128, 4, 1),
-        (128, 4, 2),
-        (128, 4, 3),
-        (128, 8, 1),
-    )
-    if q_tile in _BWD_Q_TILES
-]
-
 
 @triton.autotune(
     configs=_AUTOTUNE_CONFIGS,
@@ -727,10 +675,6 @@ def _delta_256_kernel(
     tl.store(DELTA + batch_head * Q_TOKENS + positions, delta)
 
 
-@triton.autotune(
-    configs=_AUTOTUNE_DQ_256,
-    key=["Q_TOKENS", "HEAD_DIM", "TOPK"],
-)
 @triton.jit
 def _vsa_dq_256_kernel(
     Q,
@@ -771,7 +715,7 @@ def _vsa_dq_256_kernel(
     TOPK: tl.constexpr,
     Q_TILE: tl.constexpr,
 ):
-    """Compute dQ for an autotuned physical Q tile against logical KV256."""
+    """Compute dQ for a physical Q128 tile against logical KV256."""
 
     query_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -1153,10 +1097,6 @@ def _vsa_dkdv_kernel(
     tl.store(dv_ptrs, dv, mask=kv_mask)
 
 
-@triton.autotune(
-    configs=_AUTOTUNE_DKDV_256,
-    key=["Q_TOKENS", "HEAD_DIM", "TOPK"],
-)
 @triton.jit
 def _vsa_dkdv_256_kernel(
     Q,
@@ -1205,7 +1145,7 @@ def _vsa_dkdv_256_kernel(
     BLOCK_D: tl.constexpr,
     Q_TILE: tl.constexpr,
 ):
-    """Own one KV64 quarter and consume autotuned physical Q tiles."""
+    """Own one KV64 quarter and consume physical Q128 tiles."""
 
     kv_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -1425,10 +1365,7 @@ def _triton_sparse_attention_backward(
     dv = torch.empty_like(v)
 
     if block_size == 256:
-        dq_grid = lambda meta: (
-            query_blocks * (256 // meta["Q_TILE"]),
-            batch * heads,
-        )
+        dq_grid = (query_blocks * 2, batch * heads)
         _vsa_dq_256_kernel[dq_grid](
             q,
             k,
@@ -1452,6 +1389,9 @@ def _triton_sparse_attention_backward(
             HEAD_DIM=head_dim,
             BLOCK_D=block_d,
             TOPK=topk,
+            Q_TILE=128,
+            num_warps=4,
+            num_stages=3,
         )
 
         dkdv_grid = (key_blocks * 4, batch * heads)
@@ -1483,6 +1423,9 @@ def _triton_sparse_attention_backward(
             TOPK=topk,
             HEAD_DIM=head_dim,
             BLOCK_D=block_d,
+            Q_TILE=128,
+            num_warps=4,
+            num_stages=1,
         )
     else:
         dq_grid = (query_blocks, batch * heads)
