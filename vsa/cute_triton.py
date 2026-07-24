@@ -23,13 +23,21 @@ def _cute_forward(
     variable_block_sizes: Tensor,
 ) -> tuple[Tensor, Tensor]:
     batch, heads, query_tokens, _ = q.shape
-    logical_map = torch.zeros(
-        (batch, heads, selected.shape[2], variable_block_sizes.numel()),
+    selected_128 = (
+        selected.to(torch.int64)[..., None] * 2
+        + torch.arange(2, device=q.device)
+    ).flatten(-2)
+    mask_128 = torch.zeros(
+        (
+            batch,
+            heads,
+            selected.shape[2],
+            variable_block_sizes.numel() * 2,
+        ),
         device=q.device,
         dtype=torch.bool,
     )
-    logical_map.scatter_(-1, selected.to(torch.int64), True)
-    mask_128 = logical_map.repeat_interleave(2, dim=3)
+    mask_128.scatter_(-1, selected_128, True)
     sizes = variable_block_sizes.to(torch.int32)
     sizes_128 = torch.stack(
         (sizes.clamp(0, 128), (sizes - 128).clamp(0, 128)),
