@@ -1144,28 +1144,26 @@ def _vsa_dkdv_256_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     Q_TILE: tl.constexpr,
-    KV_TILE: tl.constexpr,
 ):
-    """Own one physical KV tile and consume physical Q tiles."""
+    """Own one KV64 quarter and consume physical Q128 tiles."""
 
     kv_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
-    kv_subtiles: tl.constexpr = 256 // KV_TILE
-    kv_block = kv_subtile_pid // kv_subtiles
-    kv_subtile = kv_subtile_pid - kv_block * kv_subtiles
+    kv_block = kv_subtile_pid // 4
+    kv_subtile = kv_subtile_pid - kv_block * 4
     batch = batch_head // HEADS
     head = batch_head % HEADS
 
     rows = tl.arange(0, Q_TILE)
-    cols = tl.arange(0, KV_TILE)
+    cols = tl.arange(0, 64)
     dims = tl.arange(0, BLOCK_D)
-    kv_offsets = kv_subtile * KV_TILE + cols
+    kv_offsets = kv_subtile * 64 + cols
     kv_positions = kv_block * 256 + kv_offsets
     valid_kv_tokens = tl.load(
         KV_BLOCK_SIZES + kv_block
     ).to(tl.int32)
 
-    kv_mask = (cols[:, None] < KV_TILE) & (
+    kv_mask = (cols[:, None] < 64) & (
         dims[None, :] < HEAD_DIM
     )
     k_ptrs = (
@@ -1184,8 +1182,8 @@ def _vsa_dkdv_256_kernel(
     )
     key = tl.load(k_ptrs, mask=kv_mask, other=0.0)
     value = tl.load(v_ptrs, mask=kv_mask, other=0.0)
-    dk = tl.zeros([KV_TILE, BLOCK_D], dtype=tl.float32)
-    dv = tl.zeros([KV_TILE, BLOCK_D], dtype=tl.float32)
+    dk = tl.zeros([64, BLOCK_D], dtype=tl.float32)
+    dv = tl.zeros([64, BLOCK_D], dtype=tl.float32)
 
     metadata_offset = batch_head * KV_BLOCKS + kv_block
     inverse_row = (
@@ -1396,7 +1394,7 @@ def _triton_sparse_attention_backward(
             num_stages=3,
         )
 
-        dkdv_grid = (key_blocks * 2, batch * heads)
+        dkdv_grid = (key_blocks * 4, batch * heads)
         _vsa_dkdv_256_kernel[dkdv_grid](
             q,
             k,
@@ -1425,8 +1423,7 @@ def _triton_sparse_attention_backward(
             TOPK=topk,
             HEAD_DIM=head_dim,
             BLOCK_D=block_d,
-            Q_TILE=64,
-            KV_TILE=128,
+            Q_TILE=128,
             num_warps=4,
             num_stages=1,
         )
