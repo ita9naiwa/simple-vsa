@@ -1144,8 +1144,9 @@ def _vsa_dkdv_256_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     Q_TILE: tl.constexpr,
+    COMPUTE_DK: tl.constexpr,
 ):
-    """Own one KV64 quarter and consume physical Q128 tiles."""
+    """Compute dK or dV for one KV64 quarter from physical Q128 tiles."""
 
     kv_subtile_pid = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -1181,9 +1182,9 @@ def _vsa_dkdv_256_kernel(
         + dims[None, :] * stride_vd
     )
     key = tl.load(k_ptrs, mask=kv_mask, other=0.0)
-    value = tl.load(v_ptrs, mask=kv_mask, other=0.0)
-    dk = tl.zeros([64, BLOCK_D], dtype=tl.float32)
-    dv = tl.zeros([64, BLOCK_D], dtype=tl.float32)
+    if COMPUTE_DK:
+        value = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+    grad = tl.zeros([64, BLOCK_D], dtype=tl.float32)
 
     metadata_offset = batch_head * KV_BLOCKS + kv_block
     inverse_row = (
@@ -1238,9 +1239,6 @@ def _vsa_dkdv_256_kernel(
             lse = tl.load(
                 LSE + batch_head * Q_TOKENS + query_positions
             )
-            delta = tl.load(
-                DELTA + batch_head * Q_TOKENS + query_positions
-            )
 
             scores = (
                 tl.dot(query, tl.trans(key)).to(tl.float32)
@@ -1252,22 +1250,26 @@ def _vsa_dkdv_256_kernel(
                 tl.exp2(scores - lse[:, None]),
                 0.0,
             )
-            dp = tl.dot(
-                dout,
-                tl.trans(value),
-            ).to(tl.float32)
-            ds = probability * (
-                dp - delta[:, None]
-            ) * scale
-
-            dk += tl.dot(
-                tl.trans(ds.to(query.dtype)),
-                query,
-            )
-            dv += tl.dot(
-                tl.trans(probability.to(dout.dtype)),
-                dout,
-            )
+            if COMPUTE_DK:
+                delta = tl.load(
+                    DELTA + batch_head * Q_TOKENS + query_positions
+                )
+                dp = tl.dot(
+                    dout,
+                    tl.trans(value),
+                ).to(tl.float32)
+                ds = probability * (
+                    dp - delta[:, None]
+                ) * scale
+                grad += tl.dot(
+                    tl.trans(ds.to(query.dtype)),
+                    query,
+                )
+            else:
+                grad += tl.dot(
+                    tl.trans(probability.to(dout.dtype)),
+                    dout,
+                )
 
     dk_ptrs = (
         DK
@@ -1283,8 +1285,10 @@ def _vsa_dkdv_256_kernel(
         + kv_positions[:, None] * stride_dvs
         + dims[None, :] * stride_dvd
     )
-    tl.store(dk_ptrs, dk, mask=kv_mask)
-    tl.store(dv_ptrs, dv, mask=kv_mask)
+    if COMPUTE_DK:
+        tl.store(dk_ptrs, grad, mask=kv_mask)
+    else:
+        tl.store(dv_ptrs, grad, mask=kv_mask)
 
 
 def _triton_sparse_attention_backward(
@@ -1395,38 +1399,40 @@ def _triton_sparse_attention_backward(
         )
 
         dkdv_grid = (key_blocks * 4, batch * heads)
-        _vsa_dkdv_256_kernel[dkdv_grid](
-            q,
-            k,
-            v,
-            grad_output,
-            lse,
-            delta,
-            inverse,
-            inverse_offsets,
-            inverse_counts,
-            variable_block_sizes,
-            dk,
-            dv,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            grad_output.stride(0), grad_output.stride(1),
-            grad_output.stride(2), grad_output.stride(3),
-            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-            Q_TOKENS=query_tokens,
-            KV_BLOCKS=key_blocks,
-            HEADS=heads,
-            EDGES_PER_HEAD=query_blocks * topk,
-            SM_SCALE=sm_scale,
-            TOPK=topk,
-            HEAD_DIM=head_dim,
-            BLOCK_D=block_d,
-            Q_TILE=128,
-            num_warps=4,
-            num_stages=1,
-        )
+        for compute_dk in (True, False):
+            _vsa_dkdv_256_kernel[dkdv_grid](
+                q,
+                k,
+                v,
+                grad_output,
+                lse,
+                delta,
+                inverse,
+                inverse_offsets,
+                inverse_counts,
+                variable_block_sizes,
+                dk,
+                dv,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                grad_output.stride(0), grad_output.stride(1),
+                grad_output.stride(2), grad_output.stride(3),
+                dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                Q_TOKENS=query_tokens,
+                KV_BLOCKS=key_blocks,
+                HEADS=heads,
+                EDGES_PER_HEAD=query_blocks * topk,
+                SM_SCALE=sm_scale,
+                TOPK=topk,
+                HEAD_DIM=head_dim,
+                BLOCK_D=block_d,
+                Q_TILE=128,
+                COMPUTE_DK=compute_dk,
+                num_warps=4,
+                num_stages=1,
+            )
     else:
         dq_grid = (query_blocks, batch * heads)
         _vsa_dq_kernel[dq_grid](
